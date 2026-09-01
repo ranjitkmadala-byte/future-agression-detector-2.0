@@ -876,6 +876,21 @@ def first_persistent(g,col,threshold=5,n=3):
     return pd.NaT if x.empty else g.loc[x.index[0],'ts']
 
 
+
+def _first_persistent(g, col, threshold=5, n=3):
+    """Return timestamp of the first n-consecutive snapshots at/above threshold."""
+    if g is None or g.empty or col not in g.columns:
+        return pd.NaT
+    vals = pd.to_numeric(g[col], errors="coerce").fillna(0)
+    hits = vals.ge(threshold)
+    roll = hits.rolling(window=n, min_periods=n).sum()
+    good = roll[roll >= n]
+    if good.empty:
+        return pd.NaT
+    idx = good.index[0]
+    return g.loc[idx, "ts"]
+
+
 def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
     """v2.1 live board with intraday memory.
 

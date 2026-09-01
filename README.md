@@ -55,3 +55,7 @@ Dominant exact option is ranked by `abs(oi_change_3m * ltp)`. This is a relative
 - Reversal detection added
 - Absorption kept as a warning state
 - Peak ranking prevents late-session quietness from erasing a strong earlier event
+
+
+### v2.1 hotfix
+Restored `_first_persistent()` helper required by the State + Conviction memory engine.
