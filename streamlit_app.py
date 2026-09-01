@@ -877,6 +877,21 @@ def first_persistent(g,col,threshold=5,n=3):
 
 
 
+
+def _tail_count(values, predicate):
+    """Count consecutive trailing values that satisfy predicate."""
+    n = 0
+    for v in reversed(list(values)):
+        try:
+            ok = predicate(float(v))
+        except Exception:
+            ok = False
+        if not ok:
+            break
+        n += 1
+    return n
+
+
 def _first_persistent(g, col, threshold=5, n=3):
     """Return timestamp of the first n-consecutive snapshots at/above threshold."""
     if g is None or g.empty or col not in g.columns:

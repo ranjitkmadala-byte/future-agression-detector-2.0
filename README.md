@@ -59,3 +59,7 @@ Dominant exact option is ranked by `abs(oi_change_3m * ltp)`. This is a relative
 
 ### v2.1 hotfix
 Restored `_first_persistent()` helper required by the State + Conviction memory engine.
+
+
+### v2.1 hotfix 2
+Restored `_tail_count()` and validated both v2.1 helper functions before `build_v2_state()`.
