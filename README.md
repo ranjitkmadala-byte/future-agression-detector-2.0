@@ -1,4 +1,4 @@
-# Early Detector v2.0 — State + Conviction
+# Early Detector v2.1 — State + Conviction
 
 # Money Flow Early Detector v1.2 — Railway
 
@@ -39,10 +39,19 @@ This does NOT change the Money Flow collector, OI Spurt threshold, or 2-to-4 acc
 Dominant exact option is ranked by `abs(oi_change_3m * ltp)`. This is a relative premium-weighted OI intensity proxy, not literal cash flow.
 
 
-## v2.0 additions
+## v2.1 additions
 - v2 State tab with State + Conviction
 - Option Bull/Bear score out of 6 and persistence
 - Futures aggression imbalance and persistence
 - Price-response and Futures OI confirmation
 - WATCH / BUILDING / CONFIRMED / ACCELERATING / ABSORPTION / CONFLICT
 - Existing v1.3 diagnostic tabs retained
+
+## v2.1 enhancement
+- Current State and Current Conviction retained
+- Peak State Today and Peak Conviction Today added
+- Peak score/time remembered intraday
+- First clue now follows current direction, not whichever side appeared first
+- Reversal detection added
+- Absorption kept as a warning state
+- Peak ranking prevents late-session quietness from erasing a strong earlier event

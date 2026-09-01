@@ -875,56 +875,281 @@ def first_persistent(g,col,threshold=5,n=3):
     x=h[h>=n]
     return pd.NaT if x.empty else g.loc[x.index[0],'ts']
 
-def build_v2_state(universe_df,opt,agg,miles):
-    mm={r['symbol']:r for _,r in miles.iterrows()} if not miles.empty else {}; rows=[]
-    for _,u in universe_df.sort_values('rank').iterrows():
-        sym=u['symbol']; og=opt[opt.symbol.eq(sym)].sort_values('ts').reset_index(drop=True) if not opt.empty else pd.DataFrame(); ag=agg[agg.symbol.eq(sym)].sort_values('ts').reset_index(drop=True) if not agg.empty else pd.DataFrame()
-        bo=so=bp=sp=0; fbo=fso=pd.NaT
-        if not og.empty:
-            bo=int(og.iloc[-1].bull_option_score); so=int(og.iloc[-1].bear_option_score); bp=tail_count(og.bull_option_score,lambda x:x>=5); sp=tail_count(og.bear_option_score,lambda x:x>=5); fbo=first_persistent(og,'bull_option_score'); fso=first_persistent(og,'bear_option_score')
-        imb=px=oi=td=None; buy_p=sell_p=long_p=short_p=0; fbuy=fsell=pd.NaT
-        if not ag.empty:
-            a=ag.iloc[-1]; imb=pd.to_numeric(a.total_qty_imbalance,errors='coerce'); px=pd.to_numeric(a.price_change_3m_pct,errors='coerce'); oi=pd.to_numeric(a.oi_change_3m_pct,errors='coerce'); td=pd.to_numeric(a.delta_pct,errors='coerce')
-            buy_p=tail_count(ag.total_qty_imbalance,lambda x:x>=20); sell_p=tail_count(ag.total_qty_imbalance,lambda x:x<=-20)
-            im=pd.to_numeric(ag.total_qty_imbalance,errors='coerce'); pp=pd.to_numeric(ag.price_change_3m_pct,errors='coerce'); oo=pd.to_numeric(ag.oi_change_3m_pct,errors='coerce'); lf=(im>=20)&(pp>0)&(oo>0); sf=(im<=-20)&(pp<0)&(oo>0); long_p=tail_count(lf.astype(int),lambda x:x==1); short_p=tail_count(sf.astype(int),lambda x:x==1)
-            if lf.any(): fbuy=ag.loc[lf,'ts'].iloc[0]
-            if sf.any(): fsell=ag.loc[sf,'ts'].iloc[0]
-        def op(s,p):
-            q=3 if s>=6 else 2.5 if s>=5 else 2 if s>=4 else 1 if s>=3 else 0
-            return min(3,q+(0.5 if p>=3 else 0))
-        bull,bear=op(bo,bp),op(so,sp)
-        if pd.notna(imb):
-            if imb>=20: bull+=2 if buy_p>=3 else 1
-            if imb<=-20: bear+=2 if sell_p>=3 else 1
-        if pd.notna(px):
-            if px>0: bull+=2 if long_p>=2 else 1
-            if px<0: bear+=2 if short_p>=2 else 1
-        if pd.notna(oi) and oi>0 and pd.notna(px):
-            if px>0: bull+=2 if long_p>=2 else 1
-            if px<0: bear+=2 if short_p>=2 else 1
-        m=mm.get(sym); m24=pd.to_numeric(m.get('minutes_2_to_4'),errors='coerce') if m is not None else None
-        if pd.notna(m24) and m24<=30:
-            if bull>bear:bull+=1
-            elif bear>bull:bear+=1
-        bull,bear=min(10,bull),min(10,bear); direction='BULL' if bull>bear else 'BEAR' if bear>bull else 'MIXED'; score=max(bull,bear); conflict=bull>=4 and bear>=4
-        absorption='SELL ABSORPTION' if pd.notna(imb) and pd.notna(px) and imb<=-20 and px>=0 else 'BUY ABSORPTION' if pd.notna(imb) and pd.notna(px) and imb>=20 and px<=0 else None
-        if conflict: state,conv='CONFLICT','CONFLICT'
-        elif absorption and score<8: state,conv=absorption,'WARNING'
-        elif score>=8: state=('ACCELERATING LONG' if direction=='BULL' else 'ACCELERATING SHORT') if pd.notna(m24) and m24<=30 else ('CONFIRMED LONG' if direction=='BULL' else 'CONFIRMED SHORT'); conv='VERY HIGH'
-        elif score>=6: state,conv=('CONFIRMED LONG' if direction=='BULL' else 'CONFIRMED SHORT'),'HIGH'
-        elif score>=4: state,conv=('BUILDING LONG' if direction=='BULL' else 'BUILDING SHORT'),'MEDIUM'
-        elif score>=2: state,conv=('WATCH LONG' if direction=='BULL' else 'WATCH SHORT'),'LOW'
-        else: state,conv='NEUTRAL','LOW'
-        clues=[x for x in [('OPTIONS BULL',fbo),('OPTIONS BEAR',fso),('BUY AGGRESSION',fbuy),('SELL AGGRESSION',fsell)] if pd.notna(x[1])]; ctype,ctime=min(clues,key=lambda x:pd.Timestamp(x[1])) if clues else ('-',pd.NaT)
-        rows.append(dict(money_flow_rank=u.get('rank'),symbol=sym,state=state,conviction=conv,score=round(score,1),bull_score=round(bull,1),bear_score=round(bear,1),option_bull_score=bo,option_bear_score=so,option_persistence=max(bp,sp),total_qty_imbalance=imb,imbalance_persistence=max(buy_p,sell_p),price_change_3m_pct=px,oi_change_3m_pct=oi,trade_delta_pct=td,minutes_2_to_4=m24,time_2pct=m.get('time_2pct') if m is not None else pd.NaT,time_4pct=m.get('time_4pct') if m is not None else pd.NaT,first_detection_type=ctype,first_detection_time=ctime))
-    return pd.DataFrame(rows)
 
+def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
+    """v2.1 live board with intraday memory.
+
+    Adds:
+      - current_state / current_conviction / current_score
+      - peak_state_today / peak_conviction_today / peak_score_today / peak_state_time
+      - first_current_direction_clue
+      - first_bull_clue / first_bear_clue
+      - reversal flag + reversal_time
+      - absorption/conflict flags
+
+    The score is observational/research logic, not a trade recommendation.
+    """
+    if universe_df.empty:
+        return pd.DataFrame()
+
+    mm = {}
+    if not milestone_df.empty:
+        mm = {r["symbol"]: r for _, r in milestone_df.iterrows()}
+
+    def opt_pts(score, persist):
+        pts = 3 if score >= 6 else 2.5 if score >= 5 else 2 if score >= 4 else 1 if score >= 3 else 0
+        return min(3, pts + (0.5 if persist >= 3 else 0))
+
+    def classify_state(bull, bear, imb, px, m24):
+        bull = min(10, float(bull))
+        bear = min(10, float(bear))
+        direction = "BULL" if bull > bear else "BEAR" if bear > bull else "MIXED"
+        score = max(bull, bear)
+        conflict = bull >= 4 and bear >= 4
+
+        absorption = None
+        if pd.notna(imb) and pd.notna(px):
+            if imb <= -20 and px >= 0:
+                absorption = "SELL ABSORPTION"
+            elif imb >= 20 and px <= 0:
+                absorption = "BUY ABSORPTION"
+
+        if conflict:
+            return "CONFLICT", "CONFLICT", score, direction, absorption
+        if absorption and score < 8:
+            return absorption, "WARNING", score, direction, absorption
+        if score >= 8:
+            if pd.notna(m24) and m24 <= 30:
+                return ("ACCELERATING LONG" if direction == "BULL" else "ACCELERATING SHORT"), "VERY HIGH", score, direction, absorption
+            return ("CONFIRMED LONG" if direction == "BULL" else "CONFIRMED SHORT"), "VERY HIGH", score, direction, absorption
+        if score >= 6:
+            return ("CONFIRMED LONG" if direction == "BULL" else "CONFIRMED SHORT"), "HIGH", score, direction, absorption
+        if score >= 4:
+            return ("BUILDING LONG" if direction == "BULL" else "BUILDING SHORT"), "MEDIUM", score, direction, absorption
+        if score >= 2:
+            return ("WATCH LONG" if direction == "BULL" else "WATCH SHORT"), "LOW", score, direction, absorption
+        return "NEUTRAL", "LOW", score, direction, absorption
+
+    def score_at(sym, ts, og_all, ag_all, m):
+        og = og_all[og_all["ts"] <= ts].copy() if not og_all.empty else pd.DataFrame()
+        ag = ag_all[ag_all["ts"] <= ts].copy() if not ag_all.empty else pd.DataFrame()
+
+        bo = so = bp = sp = 0
+        if not og.empty:
+            bo = int(pd.to_numeric(og.iloc[-1]["bull_option_score"], errors="coerce") or 0)
+            so = int(pd.to_numeric(og.iloc[-1]["bear_option_score"], errors="coerce") or 0)
+            bp = _tail_count(og["bull_option_score"], lambda x: x >= 5)
+            sp = _tail_count(og["bear_option_score"], lambda x: x >= 5)
+
+        imb = px = oi = td = None
+        buy_p = sell_p = long_p = short_p = 0
+        if not ag.empty:
+            a = ag.iloc[-1]
+            imb = pd.to_numeric(a.get("total_qty_imbalance"), errors="coerce")
+            px = pd.to_numeric(a.get("price_change_3m_pct"), errors="coerce")
+            oi = pd.to_numeric(a.get("oi_change_3m_pct"), errors="coerce")
+            td = pd.to_numeric(a.get("delta_pct"), errors="coerce")
+
+            buy_p = _tail_count(ag["total_qty_imbalance"], lambda x: x >= 20)
+            sell_p = _tail_count(ag["total_qty_imbalance"], lambda x: x <= -20)
+
+            imbs = pd.to_numeric(ag["total_qty_imbalance"], errors="coerce")
+            pxs = pd.to_numeric(ag["price_change_3m_pct"], errors="coerce")
+            ois = pd.to_numeric(ag["oi_change_3m_pct"], errors="coerce")
+            lf = (imbs >= 20) & (pxs > 0) & (ois > 0)
+            sf = (imbs <= -20) & (pxs < 0) & (ois > 0)
+            long_p = _tail_count(lf.astype(int), lambda x: x == 1)
+            short_p = _tail_count(sf.astype(int), lambda x: x == 1)
+
+        bull = opt_pts(bo, bp)
+        bear = opt_pts(so, sp)
+
+        if pd.notna(imb):
+            if imb >= 20:
+                bull += 2 if buy_p >= 3 else 1
+            elif imb <= -20:
+                bear += 2 if sell_p >= 3 else 1
+
+        if pd.notna(px):
+            if px > 0:
+                bull += 2 if long_p >= 2 else 1
+            elif px < 0:
+                bear += 2 if short_p >= 2 else 1
+
+        if pd.notna(oi) and oi > 0 and pd.notna(px):
+            if px > 0:
+                bull += 2 if long_p >= 2 else 1
+            elif px < 0:
+                bear += 2 if short_p >= 2 else 1
+
+        m24 = pd.to_numeric(m.get("minutes_2_to_4"), errors="coerce") if m is not None else None
+        t4 = m.get("time_4pct") if m is not None else pd.NaT
+        # Acceleration point applies only once 4% milestone has actually occurred.
+        if pd.notna(m24) and m24 <= 30 and pd.notna(t4):
+            try:
+                accel_active = pd.Timestamp(ts) >= pd.Timestamp(t4)
+            except Exception:
+                accel_active = False
+            if accel_active:
+                if bull > bear:
+                    bull += 1
+                elif bear > bull:
+                    bear += 1
+
+        state, conviction, score, direction, absorption = classify_state(bull, bear, imb, px, m24)
+        return {
+            "ts": ts, "bull": min(10, bull), "bear": min(10, bear),
+            "state": state, "conviction": conviction, "score": score,
+            "direction": direction, "absorption": absorption,
+            "option_bull_score": bo, "option_bear_score": so,
+            "option_persistence": max(bp, sp),
+            "total_qty_imbalance": imb,
+            "imbalance_persistence": max(buy_p, sell_p),
+            "price_change_3m_pct": px,
+            "oi_change_3m_pct": oi,
+            "trade_delta_pct": td
+        }
+
+    result = []
+
+    for _, u in universe_df.sort_values("rank").iterrows():
+        sym = u["symbol"]
+        og = option_df[option_df["symbol"].eq(sym)].sort_values("ts").reset_index(drop=True) if not option_df.empty else pd.DataFrame()
+        ag = aggression_df[aggression_df["symbol"].eq(sym)].sort_values("ts").reset_index(drop=True) if not aggression_df.empty else pd.DataFrame()
+        m = mm.get(sym)
+
+        # First persistent directional option clues
+        first_bo = _first_persistent(og, "bull_option_score") if not og.empty else pd.NaT
+        first_so = _first_persistent(og, "bear_option_score") if not og.empty else pd.NaT
+
+        # First aggression+price+OI clues
+        first_buy = first_sell = pd.NaT
+        if not ag.empty:
+            imbs = pd.to_numeric(ag["total_qty_imbalance"], errors="coerce")
+            pxs = pd.to_numeric(ag["price_change_3m_pct"], errors="coerce")
+            ois = pd.to_numeric(ag["oi_change_3m_pct"], errors="coerce")
+            lf = (imbs >= 20) & (pxs > 0) & (ois > 0)
+            sf = (imbs <= -20) & (pxs < 0) & (ois > 0)
+            if lf.any():
+                first_buy = ag.loc[lf, "ts"].iloc[0]
+            if sf.any():
+                first_sell = ag.loc[sf, "ts"].iloc[0]
+
+        # Build intraday state history on union of option/aggression timestamps.
+        ts_values = []
+        if not og.empty:
+            ts_values += list(pd.to_datetime(og["ts"], errors="coerce").dropna())
+        if not ag.empty:
+            ts_values += list(pd.to_datetime(ag["ts"], errors="coerce").dropna())
+        ts_values = sorted(set(ts_values))
+
+        hist = [score_at(sym, ts, og, ag, m) for ts in ts_values]
+        hdf = pd.DataFrame(hist)
+
+        if hdf.empty:
+            current = {
+                "state":"NEUTRAL","conviction":"LOW","score":0.0,"direction":"MIXED",
+                "bull":0.0,"bear":0.0,"option_bull_score":0,"option_bear_score":0,
+                "option_persistence":0,"total_qty_imbalance":None,"imbalance_persistence":0,
+                "price_change_3m_pct":None,"oi_change_3m_pct":None,"trade_delta_pct":None
+            }
+            peak_state, peak_conviction, peak_score, peak_time = "NEUTRAL","LOW",0.0,pd.NaT
+            reversal, reversal_time = False, pd.NaT
+        else:
+            current = hdf.iloc[-1].to_dict()
+
+            # Peak = highest directional score; warnings/conflict do not override a stronger clean directional state.
+            clean = hdf[~hdf["state"].isin(["CONFLICT","SELL ABSORPTION","BUY ABSORPTION"])].copy()
+            if clean.empty:
+                clean = hdf.copy()
+            peak_idx = clean["score"].astype(float).idxmax()
+            peak = clean.loc[peak_idx]
+            peak_state = peak["state"]
+            peak_conviction = peak["conviction"]
+            peak_score = float(peak["score"])
+            peak_time = peak["ts"]
+
+            # Reversal = first meaningful direction flip after a prior meaningful opposite state.
+            reversal = False
+            reversal_time = pd.NaT
+            last_meaningful_dir = None
+            for _, hr in hdf.iterrows():
+                d = hr["direction"]
+                sc = float(hr["score"])
+                if d not in ("BULL","BEAR") or sc < 4:
+                    continue
+                if last_meaningful_dir is None:
+                    last_meaningful_dir = d
+                elif d != last_meaningful_dir:
+                    reversal = True
+                    reversal_time = hr["ts"]
+                    last_meaningful_dir = d
+
+        current_dir = current.get("direction", "MIXED")
+        direction_clues = []
+        if current_dir == "BULL":
+            if pd.notna(first_bo): direction_clues.append(("OPTIONS BULL", first_bo))
+            if pd.notna(first_buy): direction_clues.append(("BUY AGGRESSION", first_buy))
+        elif current_dir == "BEAR":
+            if pd.notna(first_so): direction_clues.append(("OPTIONS BEAR", first_so))
+            if pd.notna(first_sell): direction_clues.append(("SELL AGGRESSION", first_sell))
+
+        first_current_type, first_current_time = ("-", pd.NaT)
+        if direction_clues:
+            first_current_type, first_current_time = min(direction_clues, key=lambda x: pd.Timestamp(x[1]))
+
+        # Preserve both-side clues for diagnostics.
+        first_bull_candidates = [(k,t) for k,t in [("OPTIONS BULL", first_bo),("BUY AGGRESSION", first_buy)] if pd.notna(t)]
+        first_bear_candidates = [(k,t) for k,t in [("OPTIONS BEAR", first_so),("SELL AGGRESSION", first_sell)] if pd.notna(t)]
+        first_bull_time = min((t for _,t in first_bull_candidates), default=pd.NaT)
+        first_bear_time = min((t for _,t in first_bear_candidates), default=pd.NaT)
+
+        result.append({
+            "money_flow_rank": u.get("rank"),
+            "symbol": sym,
+
+            "current_state": current.get("state"),
+            "current_conviction": current.get("conviction"),
+            "current_score": round(float(current.get("score",0)),1),
+            "current_direction": current.get("direction"),
+            "bull_score": round(float(current.get("bull",0)),1),
+            "bear_score": round(float(current.get("bear",0)),1),
+
+            "peak_state_today": peak_state,
+            "peak_conviction_today": peak_conviction,
+            "peak_score_today": round(float(peak_score),1),
+            "peak_state_time": peak_time,
+
+            "option_bull_score": current.get("option_bull_score",0),
+            "option_bear_score": current.get("option_bear_score",0),
+            "option_persistence": current.get("option_persistence",0),
+            "total_qty_imbalance": current.get("total_qty_imbalance"),
+            "imbalance_persistence": current.get("imbalance_persistence",0),
+            "price_change_3m_pct": current.get("price_change_3m_pct"),
+            "oi_change_3m_pct": current.get("oi_change_3m_pct"),
+            "trade_delta_pct": current.get("trade_delta_pct"),
+
+            "minutes_2_to_4": pd.to_numeric(m.get("minutes_2_to_4"), errors="coerce") if m is not None else None,
+            "time_2pct": m.get("time_2pct") if m is not None else pd.NaT,
+            "time_4pct": m.get("time_4pct") if m is not None else pd.NaT,
+
+            "first_current_direction_clue": first_current_type,
+            "first_current_direction_time": first_current_time,
+            "first_bull_clue_time": first_bull_time,
+            "first_bear_clue_time": first_bear_time,
+
+            "reversal": reversal,
+            "reversal_time": reversal_time,
+            "absorption_flag": current.get("absorption")
+        })
+
+    return pd.DataFrame(result)
 
 # ============================================================
 # UI
 # ============================================================
 
-st.title("Top 20 Money Flow — Early Detector v2.0")
+st.title("Top 20 Money Flow — Early Detector v2.1")
 st.caption("State + Conviction • Options → Aggression → Price Response → Futures OI → Acceleration.")
 
 universe = load_universe()
@@ -983,22 +1208,86 @@ if latest.empty:
         "Once the 3-minute collector starts writing, the two dashboards will populate automatically."
     )
 
-tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["v2 State", "Master", "OI Detector", "Option Lead", "30-Day Monitor", "Liquidity", "Stock detail"])
+tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["v2.1 State", "Master", "OI Detector", "Option Lead", "30-Day Monitor", "Liquidity", "Stock detail"])
 
-# ---------------- v2 STATE + CONVICTION ----------------
+# ---------------- v2.1 STATE + CONVICTION + MEMORY ----------------
 with tab0:
-    st.subheader("Early Detector v2.0 — State + Conviction")
-    st.caption("All Top-20 stay visible. State describes structure; Conviction measures independent agreement.")
+    st.subheader("Early Detector v2.1 — Current + Peak State")
+    st.caption("Current state shows what is happening now. Peak state remembers the strongest clean intraday signal and when it occurred.")
+
     if v2_board.empty:
         st.info("Waiting for option-basket and futures-aggression data.")
     else:
-        board=v2_board.copy(); board['first_detection_time']=board['first_detection_time'].apply(time_ist); board['time_2pct']=board['time_2pct'].apply(time_ist); board['time_4pct']=board['time_4pct'].apply(time_ist)
-        order={'VERY HIGH':0,'HIGH':1,'MEDIUM':2,'WARNING':3,'CONFLICT':4,'LOW':5}; board['_o']=board.conviction.map(order).fillna(9); board=board.sort_values(['_o','score','money_flow_rank'],ascending=[True,False,True])
-        a,b,c,d=st.columns(4); a.metric('Very High',int((board.conviction=='VERY HIGH').sum())); b.metric('High',int((board.conviction=='HIGH').sum())); c.metric('Building',int(board.state.str.startswith('BUILDING').sum())); d.metric('Warnings/Conflict',int(board.conviction.isin(['WARNING','CONFLICT']).sum()))
-        cols=['money_flow_rank','symbol','state','conviction','score','option_bull_score','option_bear_score','option_persistence','total_qty_imbalance','imbalance_persistence','price_change_3m_pct','oi_change_3m_pct','minutes_2_to_4','first_detection_type','first_detection_time','time_2pct','time_4pct']
-        st.dataframe(board[cols],use_container_width=True,hide_index=True,column_config={'money_flow_rank':'MF Rank','state':'State','conviction':'Conviction','score':st.column_config.NumberColumn('Score /10',format='%.1f'),'option_bull_score':'Opt Bull /6','option_bear_score':'Opt Bear /6','option_persistence':'Opt Persist','total_qty_imbalance':st.column_config.NumberColumn('Qty Imbal %',format='%.1f'),'imbalance_persistence':'Agg Persist','price_change_3m_pct':st.column_config.NumberColumn('Fut Price 3m %',format='%.3f'),'oi_change_3m_pct':st.column_config.NumberColumn('Fut OI 3m %',format='%.3f'),'minutes_2_to_4':st.column_config.NumberColumn('OI 2→4 min',format='%.0f'),'first_detection_type':'First Clue','first_detection_time':'First Clue Time','time_2pct':'OI 2%','time_4pct':'OI 4%'})
-        st.caption("WATCH = one early layer • BUILDING = multiple layers developing • CONFIRMED = broad agreement • ACCELERATING = confirmed + rapid OI 2→4% • ABSORPTION = imbalance without expected price response • CONFLICT = bull and bear evidence coexist.")
-        st.caption("Conviction: LOW < MEDIUM < HIGH < VERY HIGH. Research-only; not a trade recommendation.")
+        board = v2_board.copy()
+
+        for c in ["peak_state_time","first_current_direction_time","first_bull_clue_time",
+                  "first_bear_clue_time","reversal_time","time_2pct","time_4pct"]:
+            if c in board.columns:
+                board[c] = board[c].apply(time_ist)
+
+        order = {"VERY HIGH":0, "HIGH":1, "MEDIUM":2, "WARNING":3, "CONFLICT":4, "LOW":5}
+        board["_peak_order"] = board["peak_conviction_today"].map(order).fillna(9)
+        board = board.sort_values(
+            ["_peak_order","peak_score_today","current_score","money_flow_rank"],
+            ascending=[True,False,False,True]
+        )
+
+        k1,k2,k3,k4 = st.columns(4)
+        k1.metric("Peak Very High", int((board["peak_conviction_today"]=="VERY HIGH").sum()))
+        k2.metric("Peak High", int((board["peak_conviction_today"]=="HIGH").sum()))
+        k3.metric("Reversals", int(board["reversal"].fillna(False).sum()))
+        k4.metric("Current Absorption", int(board["absorption_flag"].notna().sum()))
+
+        show = [
+            "money_flow_rank","symbol",
+            "current_state","current_conviction","current_score",
+            "peak_state_today","peak_conviction_today","peak_score_today","peak_state_time",
+            "first_current_direction_clue","first_current_direction_time",
+            "reversal","reversal_time","absorption_flag",
+            "option_bull_score","option_bear_score","option_persistence",
+            "total_qty_imbalance","imbalance_persistence",
+            "price_change_3m_pct","oi_change_3m_pct",
+            "minutes_2_to_4","time_2pct","time_4pct"
+        ]
+
+        st.dataframe(
+            board[[c for c in show if c in board.columns]],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "money_flow_rank":"MF Rank",
+                "symbol":"Symbol",
+                "current_state":"Current State",
+                "current_conviction":"Current Conviction",
+                "current_score":st.column_config.NumberColumn("Current /10",format="%.1f"),
+                "peak_state_today":"Peak State Today",
+                "peak_conviction_today":"Peak Conviction",
+                "peak_score_today":st.column_config.NumberColumn("Peak /10",format="%.1f"),
+                "peak_state_time":"Peak Time",
+                "first_current_direction_clue":"First Current-Direction Clue",
+                "first_current_direction_time":"First Current-Direction Time",
+                "reversal":"Reversal?",
+                "reversal_time":"Reversal Time",
+                "absorption_flag":"Absorption",
+                "option_bull_score":"Opt Bull /6",
+                "option_bear_score":"Opt Bear /6",
+                "option_persistence":"Opt Persist",
+                "total_qty_imbalance":st.column_config.NumberColumn("Qty Imbal %",format="%.1f"),
+                "imbalance_persistence":"Agg Persist",
+                "price_change_3m_pct":st.column_config.NumberColumn("Fut Price 3m %",format="%.3f"),
+                "oi_change_3m_pct":st.column_config.NumberColumn("Fut OI 3m %",format="%.3f"),
+                "minutes_2_to_4":st.column_config.NumberColumn("OI 2→4 min",format="%.0f"),
+                "time_2pct":"OI 2%",
+                "time_4pct":"OI 4%"
+            }
+        )
+
+        st.markdown("#### v2.1 memory logic")
+        st.caption(
+            "Current State = latest structure. Peak State Today = strongest clean directional state seen intraday. "
+            "Reversal = a meaningful bull↔bear flip after score ≥4. Absorption remains a warning when imbalance and price response disagree."
+        )
+        st.caption("Research dashboard only; state and conviction are analytical labels, not trade recommendations.")
 
 # ---------------- MASTER ----------------
 with tab1:
