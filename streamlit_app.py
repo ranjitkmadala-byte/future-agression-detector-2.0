@@ -856,7 +856,8 @@ def load_v2_aggression():
     if not aggression_table_exists(): return pd.DataFrame()
     return query_df("""
     WITH d AS (SELECT MAX(trading_date) trading_date FROM public.money_flow_universe)
-    SELECT symbol,ts,delta_pct,total_qty_imbalance,price_change_3m_pct,oi_change_3m_pct
+    SELECT symbol,ts,delta_pct,total_qty_imbalance,price_change_3m_pct,oi_change_3m_pct,
+           aggressive_buy_qty,aggressive_sell_qty,classified_trade_count
     FROM public.futures_aggression_snapshots WHERE trading_date=(SELECT trading_date FROM d)
     ORDER BY symbol,ts""")
 
@@ -874,36 +875,6 @@ def first_persistent(g,col,threshold=5,n=3):
     h=pd.to_numeric(g[col],errors='coerce').fillna(0).ge(threshold).rolling(n).sum()
     x=h[h>=n]
     return pd.NaT if x.empty else g.loc[x.index[0],'ts']
-
-
-
-
-def _tail_count(values, predicate):
-    """Count consecutive trailing values that satisfy predicate."""
-    n = 0
-    for v in reversed(list(values)):
-        try:
-            ok = predicate(float(v))
-        except Exception:
-            ok = False
-        if not ok:
-            break
-        n += 1
-    return n
-
-
-def _first_persistent(g, col, threshold=5, n=3):
-    """Return timestamp of the first n-consecutive snapshots at/above threshold."""
-    if g is None or g.empty or col not in g.columns:
-        return pd.NaT
-    vals = pd.to_numeric(g[col], errors="coerce").fillna(0)
-    hits = vals.ge(threshold)
-    roll = hits.rolling(window=n, min_periods=n).sum()
-    good = roll[roll >= n]
-    if good.empty:
-        return pd.NaT
-    idx = good.index[0]
-    return g.loc[idx, "ts"]
 
 
 def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
@@ -930,7 +901,7 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
         pts = 3 if score >= 6 else 2.5 if score >= 5 else 2 if score >= 4 else 1 if score >= 3 else 0
         return min(3, pts + (0.5 if persist >= 3 else 0))
 
-    def classify_state(bull, bear, imb, px, m24):
+    def classify_state(bull, bear, imb, px, td, delta_eligible, m24):
         bull = min(10, float(bull))
         bear = min(10, float(bear))
         direction = "BULL" if bull > bear else "BEAR" if bear > bull else "MIXED"
@@ -938,10 +909,12 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
         conflict = bull >= 4 and bear >= 4
 
         absorption = None
-        if pd.notna(imb) and pd.notna(px):
-            if imb <= -20 and px >= 0:
+        if pd.notna(px):
+            sell_pressure = (delta_eligible and td <= -30) or (pd.notna(imb) and imb <= -20)
+            buy_pressure = (delta_eligible and td >= 30) or (pd.notna(imb) and imb >= 20)
+            if sell_pressure and px >= 0:
                 absorption = "SELL ABSORPTION"
-            elif imb >= 20 and px <= 0:
+            elif buy_pressure and px <= 0:
                 absorption = "BUY ABSORPTION"
 
         if conflict:
@@ -972,13 +945,25 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
             sp = _tail_count(og["bear_option_score"], lambda x: x >= 5)
 
         imb = px = oi = td = None
-        buy_p = sell_p = long_p = short_p = 0
+        classified_trades = classified_qty = 0
+        buy_p = sell_p = long_p = short_p = delta_buy_p = delta_sell_p = 0
+        delta_eligible = False
+        aggression_quality = "NO DATA"
+        flow_agreement = "NO DATA"
         if not ag.empty:
             a = ag.iloc[-1]
             imb = pd.to_numeric(a.get("total_qty_imbalance"), errors="coerce")
             px = pd.to_numeric(a.get("price_change_3m_pct"), errors="coerce")
             oi = pd.to_numeric(a.get("oi_change_3m_pct"), errors="coerce")
             td = pd.to_numeric(a.get("delta_pct"), errors="coerce")
+            classified_trades_raw = pd.to_numeric(a.get("classified_trade_count"), errors="coerce")
+            classified_trades = 0 if pd.isna(classified_trades_raw) else int(classified_trades_raw)
+            aggressive_buy = pd.to_numeric(a.get("aggressive_buy_qty"), errors="coerce")
+            aggressive_sell = pd.to_numeric(a.get("aggressive_sell_qty"), errors="coerce")
+            classified_qty = int((0 if pd.isna(aggressive_buy) else aggressive_buy) +
+                                 (0 if pd.isna(aggressive_sell) else aggressive_sell))
+            delta_eligible = pd.notna(td) and classified_trades >= 5 and classified_qty > 0
+            aggression_quality = "ELIGIBLE" if delta_eligible else "LOW SAMPLE"
 
             buy_p = _tail_count(ag["total_qty_imbalance"], lambda x: x >= 20)
             sell_p = _tail_count(ag["total_qty_imbalance"], lambda x: x <= -20)
@@ -991,14 +976,40 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
             long_p = _tail_count(lf.astype(int), lambda x: x == 1)
             short_p = _tail_count(sf.astype(int), lambda x: x == 1)
 
+            trades = pd.to_numeric(ag["classified_trade_count"], errors="coerce").fillna(0)
+            buys = pd.to_numeric(ag["aggressive_buy_qty"], errors="coerce").fillna(0)
+            sells = pd.to_numeric(ag["aggressive_sell_qty"], errors="coerce").fillna(0)
+            deltas = pd.to_numeric(ag["delta_pct"], errors="coerce")
+            eligible = (trades >= 5) & ((buys + sells) > 0)
+            delta_buy_p = _tail_count((eligible & (deltas >= 30)).astype(int), lambda x: x == 1)
+            delta_sell_p = _tail_count((eligible & (deltas <= -30)).astype(int), lambda x: x == 1)
+
+            if delta_eligible and pd.notna(imb):
+                if td >= 30 and imb >= 20:
+                    flow_agreement = "BUY AGREEMENT"
+                elif td <= -30 and imb <= -20:
+                    flow_agreement = "SELL AGREEMENT"
+                elif abs(td) >= 30 and abs(imb) >= 20:
+                    flow_agreement = "ORDER-FLOW CONFLICT"
+                else:
+                    flow_agreement = "PARTIAL / NEUTRAL"
+
         bull = opt_pts(bo, bp)
         bear = opt_pts(so, sp)
 
+        # Displayed order quantity is supporting evidence only (maximum 1 point).
         if pd.notna(imb):
             if imb >= 20:
-                bull += 2 if buy_p >= 3 else 1
+                bull += 1
             elif imb <= -20:
-                bear += 2 if sell_p >= 3 else 1
+                bear += 1
+
+        # Executed delta receives up to 2 points, but only with a useful sample.
+        if delta_eligible:
+            if td >= 30:
+                bull += 2 if delta_buy_p >= 2 else 1
+            elif td <= -30:
+                bear += 2 if delta_sell_p >= 2 else 1
 
         if pd.notna(px):
             if px > 0:
@@ -1026,7 +1037,9 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
                 elif bear > bull:
                     bear += 1
 
-        state, conviction, score, direction, absorption = classify_state(bull, bear, imb, px, m24)
+        state, conviction, score, direction, absorption = classify_state(
+            bull, bear, imb, px, td, delta_eligible, m24
+        )
         return {
             "ts": ts, "bull": min(10, bull), "bear": min(10, bear),
             "state": state, "conviction": conviction, "score": score,
@@ -1037,7 +1050,12 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
             "imbalance_persistence": max(buy_p, sell_p),
             "price_change_3m_pct": px,
             "oi_change_3m_pct": oi,
-            "trade_delta_pct": td
+            "trade_delta_pct": td,
+            "classified_trade_count": classified_trades,
+            "classified_qty": classified_qty,
+            "delta_persistence": max(delta_buy_p, delta_sell_p),
+            "aggression_quality": aggression_quality,
+            "order_flow_agreement": flow_agreement
         }
 
     result = []
@@ -1052,14 +1070,18 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
         first_bo = _first_persistent(og, "bull_option_score") if not og.empty else pd.NaT
         first_so = _first_persistent(og, "bear_option_score") if not og.empty else pd.NaT
 
-        # First aggression+price+OI clues
+        # First reliable executed-aggression + price + OI clues.
         first_buy = first_sell = pd.NaT
         if not ag.empty:
-            imbs = pd.to_numeric(ag["total_qty_imbalance"], errors="coerce")
             pxs = pd.to_numeric(ag["price_change_3m_pct"], errors="coerce")
             ois = pd.to_numeric(ag["oi_change_3m_pct"], errors="coerce")
-            lf = (imbs >= 20) & (pxs > 0) & (ois > 0)
-            sf = (imbs <= -20) & (pxs < 0) & (ois > 0)
+            deltas = pd.to_numeric(ag["delta_pct"], errors="coerce")
+            trades = pd.to_numeric(ag["classified_trade_count"], errors="coerce").fillna(0)
+            qty = (pd.to_numeric(ag["aggressive_buy_qty"], errors="coerce").fillna(0) +
+                   pd.to_numeric(ag["aggressive_sell_qty"], errors="coerce").fillna(0))
+            eligible = (trades >= 5) & (qty > 0)
+            lf = eligible & (deltas >= 30) & (pxs > 0) & (ois > 0)
+            sf = eligible & (deltas <= -30) & (pxs < 0) & (ois > 0)
             if lf.any():
                 first_buy = ag.loc[lf, "ts"].iloc[0]
             if sf.any():
@@ -1081,7 +1103,9 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
                 "state":"NEUTRAL","conviction":"LOW","score":0.0,"direction":"MIXED",
                 "bull":0.0,"bear":0.0,"option_bull_score":0,"option_bear_score":0,
                 "option_persistence":0,"total_qty_imbalance":None,"imbalance_persistence":0,
-                "price_change_3m_pct":None,"oi_change_3m_pct":None,"trade_delta_pct":None
+                "price_change_3m_pct":None,"oi_change_3m_pct":None,"trade_delta_pct":None,
+                "classified_trade_count":0,"classified_qty":0,"delta_persistence":0,
+                "aggression_quality":"NO DATA","order_flow_agreement":"NO DATA"
             }
             peak_state, peak_conviction, peak_score, peak_time = "NEUTRAL","LOW",0.0,pd.NaT
             reversal, reversal_time = False, pd.NaT
@@ -1158,6 +1182,11 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
             "price_change_3m_pct": current.get("price_change_3m_pct"),
             "oi_change_3m_pct": current.get("oi_change_3m_pct"),
             "trade_delta_pct": current.get("trade_delta_pct"),
+            "classified_trade_count": current.get("classified_trade_count",0),
+            "classified_qty": current.get("classified_qty",0),
+            "delta_persistence": current.get("delta_persistence",0),
+            "aggression_quality": current.get("aggression_quality","NO DATA"),
+            "order_flow_agreement": current.get("order_flow_agreement","NO DATA"),
 
             "minutes_2_to_4": pd.to_numeric(m.get("minutes_2_to_4"), errors="coerce") if m is not None else None,
             "time_2pct": m.get("time_2pct") if m is not None else pd.NaT,
@@ -1179,8 +1208,8 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
 # UI
 # ============================================================
 
-st.title("Top 20 Money Flow — Early Detector v2.1")
-st.caption("State + Conviction • Options → Aggression → Price Response → Futures OI → Acceleration.")
+st.title("Top 20 Money Flow — Early Detector v2.2")
+st.caption("State + Conviction • Options → Executed Delta → Order Book → Price Response → Futures OI → Acceleration.")
 
 universe = load_universe()
 latest = build_master_score(load_latest_snapshots())
@@ -1238,10 +1267,15 @@ if latest.empty:
         "Once the 3-minute collector starts writing, the two dashboards will populate automatically."
     )
 
-tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["v2.1 State", "Master", "OI Detector", "Option Lead", "30-Day Monitor", "Liquidity", "Stock detail"])
+tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["v2.2 State", "Master", "OI Detector", "Option Lead", "30-Day Monitor", "Liquidity", "Stock detail"])
 
 # ---------------- v2.1 STATE + CONVICTION + MEMORY ----------------
 with tab0:
+    if v2_aggression.empty:
+        st.warning(
+            "Futures aggression is unavailable for the current universe date. "
+            "Scores are option-only and should not be compared with fully confirmed scores."
+        )
     st.subheader("Early Detector v2.1 — Current + Peak State")
     st.caption("Current state shows what is happening now. Peak state remembers the strongest clean intraday signal and when it occurred.")
 
@@ -1276,6 +1310,8 @@ with tab0:
             "reversal","reversal_time","absorption_flag",
             "option_bull_score","option_bear_score","option_persistence",
             "total_qty_imbalance","imbalance_persistence",
+            "trade_delta_pct","classified_trade_count","classified_qty",
+            "delta_persistence","aggression_quality","order_flow_agreement",
             "price_change_3m_pct","oi_change_3m_pct",
             "minutes_2_to_4","time_2pct","time_4pct"
         ]
@@ -1304,6 +1340,12 @@ with tab0:
                 "option_persistence":"Opt Persist",
                 "total_qty_imbalance":st.column_config.NumberColumn("Qty Imbal %",format="%.1f"),
                 "imbalance_persistence":"Agg Persist",
+                "trade_delta_pct":st.column_config.NumberColumn("Executed Delta %",format="%.1f"),
+                "classified_trade_count":"Classified Trades",
+                "classified_qty":"Classified Qty",
+                "delta_persistence":"Delta Persist",
+                "aggression_quality":"Delta Quality",
+                "order_flow_agreement":"Book–Trade Agreement",
                 "price_change_3m_pct":st.column_config.NumberColumn("Fut Price 3m %",format="%.3f"),
                 "oi_change_3m_pct":st.column_config.NumberColumn("Fut OI 3m %",format="%.3f"),
                 "minutes_2_to_4":st.column_config.NumberColumn("OI 2→4 min",format="%.0f"),
@@ -1312,7 +1354,7 @@ with tab0:
             }
         )
 
-        st.markdown("#### v2.1 memory logic")
+        st.markdown("#### v2.2 executed-aggression logic")
         st.caption(
             "Current State = latest structure. Peak State Today = strongest clean directional state seen intraday. "
             "Reversal = a meaningful bull↔bear flip after score ≥4. Absorption remains a warning when imbalance and price response disagree."
