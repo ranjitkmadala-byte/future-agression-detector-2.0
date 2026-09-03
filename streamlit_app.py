@@ -941,8 +941,8 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
         if not og.empty:
             bo = int(pd.to_numeric(og.iloc[-1]["bull_option_score"], errors="coerce") or 0)
             so = int(pd.to_numeric(og.iloc[-1]["bear_option_score"], errors="coerce") or 0)
-            bp = _tail_count(og["bull_option_score"], lambda x: x >= 5)
-            sp = _tail_count(og["bear_option_score"], lambda x: x >= 5)
+            bp = tail_count(og["bull_option_score"], lambda x: x >= 5)
+            sp = tail_count(og["bear_option_score"], lambda x: x >= 5)
 
         imb = px = oi = td = None
         classified_trades = classified_qty = 0
@@ -965,24 +965,24 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
             delta_eligible = pd.notna(td) and classified_trades >= 5 and classified_qty > 0
             aggression_quality = "ELIGIBLE" if delta_eligible else "LOW SAMPLE"
 
-            buy_p = _tail_count(ag["total_qty_imbalance"], lambda x: x >= 20)
-            sell_p = _tail_count(ag["total_qty_imbalance"], lambda x: x <= -20)
+            buy_p = tail_count(ag["total_qty_imbalance"], lambda x: x >= 20)
+            sell_p = tail_count(ag["total_qty_imbalance"], lambda x: x <= -20)
 
             imbs = pd.to_numeric(ag["total_qty_imbalance"], errors="coerce")
             pxs = pd.to_numeric(ag["price_change_3m_pct"], errors="coerce")
             ois = pd.to_numeric(ag["oi_change_3m_pct"], errors="coerce")
             lf = (imbs >= 20) & (pxs > 0) & (ois > 0)
             sf = (imbs <= -20) & (pxs < 0) & (ois > 0)
-            long_p = _tail_count(lf.astype(int), lambda x: x == 1)
-            short_p = _tail_count(sf.astype(int), lambda x: x == 1)
+            long_p = tail_count(lf.astype(int), lambda x: x == 1)
+            short_p = tail_count(sf.astype(int), lambda x: x == 1)
 
             trades = pd.to_numeric(ag["classified_trade_count"], errors="coerce").fillna(0)
             buys = pd.to_numeric(ag["aggressive_buy_qty"], errors="coerce").fillna(0)
             sells = pd.to_numeric(ag["aggressive_sell_qty"], errors="coerce").fillna(0)
             deltas = pd.to_numeric(ag["delta_pct"], errors="coerce")
             eligible = (trades >= 5) & ((buys + sells) > 0)
-            delta_buy_p = _tail_count((eligible & (deltas >= 30)).astype(int), lambda x: x == 1)
-            delta_sell_p = _tail_count((eligible & (deltas <= -30)).astype(int), lambda x: x == 1)
+            delta_buy_p = tail_count((eligible & (deltas >= 30)).astype(int), lambda x: x == 1)
+            delta_sell_p = tail_count((eligible & (deltas <= -30)).astype(int), lambda x: x == 1)
 
             if delta_eligible and pd.notna(imb):
                 if td >= 30 and imb >= 20:
@@ -1067,8 +1067,8 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
         m = mm.get(sym)
 
         # First persistent directional option clues
-        first_bo = _first_persistent(og, "bull_option_score") if not og.empty else pd.NaT
-        first_so = _first_persistent(og, "bear_option_score") if not og.empty else pd.NaT
+        first_bo = first_persistent(og, "bull_option_score") if not og.empty else pd.NaT
+        first_so = first_persistent(og, "bear_option_score") if not og.empty else pd.NaT
 
         # First reliable executed-aggression + price + OI clues.
         first_buy = first_sell = pd.NaT
