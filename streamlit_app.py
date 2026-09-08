@@ -75,6 +75,97 @@ def query_df(sql, params=None):
     return pd.DataFrame(rows)
 
 
+def ensure_early_detector_snapshots_table():
+    """Create the persistent v2.2 score-history table when it is absent."""
+    sql = """
+    CREATE TABLE IF NOT EXISTS public.early_detector_snapshots (
+        id BIGSERIAL PRIMARY KEY,
+        trading_date DATE NOT NULL,
+        ts TIMESTAMPTZ NOT NULL,
+        money_flow_rank INTEGER,
+        symbol TEXT NOT NULL,
+
+        state TEXT NOT NULL,
+        conviction TEXT NOT NULL,
+        score NUMERIC NOT NULL,
+        direction TEXT NOT NULL,
+        bull_score NUMERIC NOT NULL,
+        bear_score NUMERIC NOT NULL,
+
+        option_bull_score INTEGER NOT NULL DEFAULT 0,
+        option_bear_score INTEGER NOT NULL DEFAULT 0,
+        option_persistence INTEGER NOT NULL DEFAULT 0,
+        total_qty_imbalance NUMERIC,
+        imbalance_persistence INTEGER NOT NULL DEFAULT 0,
+        trade_delta_pct NUMERIC,
+        classified_trade_count INTEGER NOT NULL DEFAULT 0,
+        classified_qty BIGINT NOT NULL DEFAULT 0,
+        delta_persistence INTEGER NOT NULL DEFAULT 0,
+        aggression_quality TEXT NOT NULL,
+        order_flow_agreement TEXT NOT NULL,
+        price_change_3m_pct NUMERIC,
+        oi_change_3m_pct NUMERIC,
+        absorption_flag TEXT,
+        minutes_2_to_4 NUMERIC,
+        option_source_ts TIMESTAMPTZ,
+        aggression_source_ts TIMESTAMPTZ,
+
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE (trading_date, ts, symbol)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_early_detector_date_symbol_ts
+        ON public.early_detector_snapshots (trading_date, symbol, ts);
+    """
+    with psycopg.connect(DATABASE_URL) as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+        conn.commit()
+
+
+def persist_early_detector_snapshots(history_df):
+    """Idempotently persist reconstructed score history for the current universe."""
+    if history_df is None or history_df.empty:
+        return 0
+
+    ensure_early_detector_snapshots_table()
+    columns = [
+        "trading_date", "ts", "money_flow_rank", "symbol",
+        "state", "conviction", "score", "direction", "bull_score", "bear_score",
+        "option_bull_score", "option_bear_score", "option_persistence",
+        "total_qty_imbalance", "imbalance_persistence", "trade_delta_pct",
+        "classified_trade_count", "classified_qty", "delta_persistence",
+        "aggression_quality", "order_flow_agreement", "price_change_3m_pct",
+        "oi_change_3m_pct", "absorption_flag", "minutes_2_to_4",
+        "option_source_ts", "aggression_source_ts"
+    ]
+
+    def db_value(value):
+        if value is None or pd.isna(value):
+            return None
+        if hasattr(value, "item"):
+            return value.item()
+        return value
+
+    rows = [tuple(db_value(row.get(col)) for col in columns)
+            for _, row in history_df.iterrows()]
+    placeholders = ", ".join(["%s"] * len(columns))
+    update_columns = [c for c in columns if c not in ("trading_date", "ts", "symbol")]
+    assignments = ", ".join(f"{c}=EXCLUDED.{c}" for c in update_columns)
+    sql = f"""
+        INSERT INTO public.early_detector_snapshots ({', '.join(columns)})
+        VALUES ({placeholders})
+        ON CONFLICT (trading_date, ts, symbol) DO UPDATE SET
+            {assignments}, updated_at=NOW()
+    """
+    with psycopg.connect(DATABASE_URL) as conn:
+        with conn.cursor() as cur:
+            cur.executemany(sql, rows)
+        conn.commit()
+    return len(rows)
+
+
 def load_universe():
     sql = """
     WITH latest_date AS (
@@ -943,7 +1034,9 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
         ag = ag_all[ag_all["ts"] <= ts].copy() if not ag_all.empty else pd.DataFrame()
 
         bo = so = bp = sp = 0
+        option_source_ts = pd.NaT
         if not og.empty:
+            option_source_ts = og.iloc[-1]["ts"]
             bo = int(pd.to_numeric(og.iloc[-1]["bull_option_score"], errors="coerce") or 0)
             so = int(pd.to_numeric(og.iloc[-1]["bear_option_score"], errors="coerce") or 0)
             bp = tail_count(og["bull_option_score"], lambda x: x >= 5)
@@ -955,8 +1048,10 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
         delta_eligible = False
         aggression_quality = "NO DATA"
         flow_agreement = "NO DATA"
+        aggression_source_ts = pd.NaT
         if not ag.empty:
             a = ag.iloc[-1]
+            aggression_source_ts = a.get("ts")
             imb = pd.to_numeric(a.get("total_qty_imbalance"), errors="coerce")
             px = pd.to_numeric(a.get("price_change_3m_pct"), errors="coerce")
             oi = pd.to_numeric(a.get("oi_change_3m_pct"), errors="coerce")
@@ -1060,10 +1155,13 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
             "classified_qty": classified_qty,
             "delta_persistence": max(delta_buy_p, delta_sell_p),
             "aggression_quality": aggression_quality,
-            "order_flow_agreement": flow_agreement
+            "order_flow_agreement": flow_agreement,
+            "option_source_ts": option_source_ts,
+            "aggression_source_ts": aggression_source_ts
         }
 
     result = []
+    snapshot_history = []
 
     for _, u in universe_df.sort_values("rank").iterrows():
         sym = u["symbol"]
@@ -1102,6 +1200,27 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
 
         hist = [score_at(sym, ts, og, ag, m) for ts in ts_values]
         hdf = pd.DataFrame(hist)
+
+        # Retain every reconstructed state so it can be persisted independently
+        # of the current dashboard row. Re-running safely updates the same keys.
+        if not hdf.empty:
+            trading_date = u.get("trading_date")
+            if pd.isna(trading_date):
+                trading_date = pd.Timestamp(hdf["ts"].iloc[0]).tz_convert(IST).date()
+            else:
+                trading_date = pd.Timestamp(trading_date).date()
+            history_copy = hdf.copy()
+            history_copy["trading_date"] = trading_date
+            history_copy["money_flow_rank"] = u.get("rank")
+            history_copy["symbol"] = sym
+            history_copy["bull_score"] = history_copy["bull"]
+            history_copy["bear_score"] = history_copy["bear"]
+            history_copy["absorption_flag"] = history_copy["absorption"]
+            history_copy["minutes_2_to_4"] = (
+                pd.to_numeric(m.get("minutes_2_to_4"), errors="coerce")
+                if m is not None else None
+            )
+            snapshot_history.append(history_copy)
 
         if hdf.empty:
             current = {
@@ -1207,7 +1326,12 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
             "absorption_flag": current.get("absorption")
         })
 
-    return pd.DataFrame(result)
+    result_df = pd.DataFrame(result)
+    result_df.attrs["snapshot_history"] = (
+        pd.concat(snapshot_history, ignore_index=True)
+        if snapshot_history else pd.DataFrame()
+    )
+    return result_df
 
 # ============================================================
 # UI
@@ -1227,6 +1351,14 @@ option_doubles = load_first_option_doubles() if not universe.empty else pd.DataF
 v2_option_baskets = load_v2_option_baskets() if not universe.empty else pd.DataFrame()
 v2_aggression = load_v2_aggression() if not universe.empty else pd.DataFrame()
 v2_board = build_v2_state(universe, v2_option_baskets, v2_aggression, milestones) if not universe.empty else pd.DataFrame()
+
+if not v2_board.empty:
+    try:
+        persisted_rows = persist_early_detector_snapshots(
+            v2_board.attrs.get("snapshot_history", pd.DataFrame())
+        )
+    except Exception as exc:
+        st.warning(f"Early Detector score history could not be saved: {exc}")
 
 if not latest.empty and not universe.empty:
     baseline = universe[["symbol", "spot_price", "future_price", "future_oi", "futures_value_cr"]].rename(
@@ -1819,5 +1951,5 @@ with r2:
     st.caption("Keep this page open on your phone. Use Refresh now after each 3-minute collector cycle.")
 
 st.caption(
-    "Data source: your Neon database. The dashboard is read-only and does not place trades or modify market data."
+    "Data source: your Neon database. The dashboard stores reconstructed Early Detector score history; it does not place trades."
 )
