@@ -1333,6 +1333,117 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
     )
     return result_df
 
+
+def build_fast_reversal_events(history_df):
+    """Detect strong-score invalidations and meaningful opposite-direction flips.
+
+    A strong run begins at a clean score of at least 8. It is considered rapidly
+    invalidated when the original directional component falls below 4 within the
+    next two canonical three-minute observations. An opposite direction must then
+    reach a clean score of at least 4 within six observations (18 minutes).
+    """
+    if history_df is None or history_df.empty:
+        return pd.DataFrame()
+
+    h = history_df.copy()
+    h["ts"] = pd.to_datetime(h["ts"], utc=True, errors="coerce")
+    h = h.dropna(subset=["ts", "symbol"])
+    h["bucket"] = h["ts"].dt.floor("3min")
+    h = (
+        h.sort_values("ts")
+        .groupby(["symbol", "bucket"], as_index=False)
+        .tail(1)
+        .sort_values(["symbol", "ts"])
+    )
+
+    excluded_states = {"CONFLICT", "SELL ABSORPTION", "BUY ABSORPTION"}
+    events = []
+
+    for symbol, group in h.groupby("symbol", sort=False):
+        g = group.reset_index(drop=True)
+        strong = (
+            pd.to_numeric(g["score"], errors="coerce").fillna(0).ge(8)
+            & g["direction"].isin(["BULL", "BEAR"])
+            & ~g["state"].isin(excluded_states)
+        )
+        positions = list(g.index[strong])
+        if not positions:
+            continue
+
+        runs = []
+        run = [positions[0]]
+        for pos in positions[1:]:
+            if pos == run[-1] + 1 and g.loc[pos, "direction"] == g.loc[run[-1], "direction"]:
+                run.append(pos)
+            else:
+                runs.append(run)
+                run = [pos]
+        runs.append(run)
+
+        consumed_until = -1
+        for run in runs:
+            if run[0] <= consumed_until:
+                continue
+            peak_pos = max(run, key=lambda p: float(g.loc[p, "score"]))
+            peak = g.loc[peak_pos]
+            peak_direction = peak["direction"]
+            component_col = "bull" if peak_direction == "BULL" else "bear"
+            opposite = "BEAR" if peak_direction == "BULL" else "BULL"
+            run_end = run[-1]
+
+            invalidation_pos = None
+            for pos in range(run_end + 1, min(len(g), run_end + 3)):
+                component = pd.to_numeric(g.loc[pos, component_col], errors="coerce")
+                if pd.isna(component) or component < 4:
+                    invalidation_pos = pos
+                    break
+            if invalidation_pos is None:
+                continue
+
+            reversal_pos = None
+            for pos in range(invalidation_pos, min(len(g), invalidation_pos + 7)):
+                row = g.loc[pos]
+                if (
+                    row["direction"] == opposite
+                    and float(row["score"]) >= 4
+                    and row["state"] not in excluded_states
+                ):
+                    reversal_pos = pos
+                    break
+
+            invalidation = g.loc[invalidation_pos]
+            reversal = g.loc[reversal_pos] if reversal_pos is not None else None
+            minutes_to_invalidation = (
+                invalidation["ts"] - peak["ts"]
+            ).total_seconds() / 60.0
+            minutes_to_reversal = (
+                (reversal["ts"] - peak["ts"]).total_seconds() / 60.0
+                if reversal is not None else None
+            )
+
+            events.append({
+                "money_flow_rank": peak.get("money_flow_rank"),
+                "symbol": symbol,
+                "event": "FAST REVERSAL" if reversal is not None else "PEAK INVALIDATED",
+                "peak_direction": peak_direction,
+                "peak_state": peak["state"],
+                "peak_score": float(peak["score"]),
+                "peak_time": peak["ts"],
+                "invalidation_state": invalidation["state"],
+                "invalidation_score": float(invalidation["score"]),
+                "invalidation_time": invalidation["ts"],
+                "minutes_to_invalidation": round(minutes_to_invalidation, 1),
+                "reversal_direction": opposite if reversal is not None else "-",
+                "reversal_state": reversal["state"] if reversal is not None else "-",
+                "reversal_score": float(reversal["score"]) if reversal is not None else None,
+                "reversal_time": reversal["ts"] if reversal is not None else pd.NaT,
+                "minutes_peak_to_reversal": round(minutes_to_reversal, 1) if minutes_to_reversal is not None else None,
+            })
+            if reversal_pos is not None:
+                consumed_until = reversal_pos
+
+    return pd.DataFrame(events)
+
 # ============================================================
 # UI
 # ============================================================
@@ -1351,6 +1462,9 @@ option_doubles = load_first_option_doubles() if not universe.empty else pd.DataF
 v2_option_baskets = load_v2_option_baskets() if not universe.empty else pd.DataFrame()
 v2_aggression = load_v2_aggression() if not universe.empty else pd.DataFrame()
 v2_board = build_v2_state(universe, v2_option_baskets, v2_aggression, milestones) if not universe.empty else pd.DataFrame()
+reversal_events = build_fast_reversal_events(
+    v2_board.attrs.get("snapshot_history", pd.DataFrame())
+) if not v2_board.empty else pd.DataFrame()
 
 if not v2_board.empty:
     try:
@@ -1404,7 +1518,10 @@ if latest.empty:
         "Once the 3-minute collector starts writing, the two dashboards will populate automatically."
     )
 
-tab0, tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["v2.2 State", "Master", "OI Detector", "Option Lead", "30-Day Monitor", "Liquidity", "Stock detail"])
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    "v2.2 State", "Master", "OI Detector", "Option Lead",
+    "30-Day Monitor", "Liquidity", "Stock detail", "Fast Reversals"
+])
 
 # ---------------- v2.1 STATE + CONVICTION + MEMORY ----------------
 with tab0:
@@ -1939,6 +2056,83 @@ with tab6:
             )
     else:
         st.info("No 3-minute snapshot exists yet for this stock.")
+
+
+# ---------------- FAST REVERSALS ----------------
+with tab7:
+    st.subheader("Fast Reversals — Strong Peak Invalidation")
+    st.caption(
+        "Flags a clean score ≥8 whose original directional score falls below 4 within two "
+        "three-minute observations. A Fast Reversal additionally requires the opposite direction "
+        "to reach a clean score ≥4 within 18 minutes."
+    )
+
+    if reversal_events.empty:
+        st.info("No strong-peak invalidation or fast reversal has been detected for this trading date.")
+    else:
+        rev = reversal_events.copy()
+        fast_count = int(rev["event"].eq("FAST REVERSAL").sum())
+        invalidated_count = int(rev["event"].eq("PEAK INVALIDATED").sum())
+        bear_to_bull = int(
+            ((rev["event"] == "FAST REVERSAL") &
+             (rev["peak_direction"] == "BEAR") &
+             (rev["reversal_direction"] == "BULL")).sum()
+        )
+        bull_to_bear = int(
+            ((rev["event"] == "FAST REVERSAL") &
+             (rev["peak_direction"] == "BULL") &
+             (rev["reversal_direction"] == "BEAR")).sum()
+        )
+
+        q1, q2, q3, q4 = st.columns(4)
+        q1.metric("Fast reversals", fast_count)
+        q2.metric("Peak invalidations", invalidated_count)
+        q3.metric("Bear → Bull", bear_to_bull)
+        q4.metric("Bull → Bear", bull_to_bear)
+
+        for col in ["peak_time", "invalidation_time", "reversal_time"]:
+            rev[col] = rev[col].apply(time_ist)
+
+        show = [
+            "money_flow_rank", "symbol", "event",
+            "peak_direction", "peak_state", "peak_score", "peak_time",
+            "invalidation_state", "invalidation_score", "invalidation_time",
+            "minutes_to_invalidation", "reversal_direction", "reversal_state",
+            "reversal_score", "reversal_time", "minutes_peak_to_reversal",
+        ]
+        rev = rev.sort_values(
+            ["event", "minutes_peak_to_reversal", "peak_score"],
+            ascending=[True, True, False],
+            na_position="last",
+        )
+        st.dataframe(
+            rev[show],
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "money_flow_rank": "Rank",
+                "symbol": "Symbol",
+                "event": "Event",
+                "peak_direction": "Peak Direction",
+                "peak_state": "Peak State",
+                "peak_score": st.column_config.NumberColumn("Peak", format="%.1f"),
+                "peak_time": "Peak Time",
+                "invalidation_state": "Invalidation State",
+                "invalidation_score": st.column_config.NumberColumn("After Peak", format="%.1f"),
+                "invalidation_time": "Invalidated",
+                "minutes_to_invalidation": st.column_config.NumberColumn("Peak→Invalid (min)", format="%.1f"),
+                "reversal_direction": "New Direction",
+                "reversal_state": "Reversal State",
+                "reversal_score": st.column_config.NumberColumn("Reversal Score", format="%.1f"),
+                "reversal_time": "Reversal Time",
+                "minutes_peak_to_reversal": st.column_config.NumberColumn("Peak→Reversal (min)", format="%.1f"),
+            },
+        )
+
+        st.caption(
+            "Peak Invalidated means the strong direction collapsed quickly but the opposite side "
+            "did not yet achieve meaningful confirmation."
+        )
 
 st.divider()
 
