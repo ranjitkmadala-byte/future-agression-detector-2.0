@@ -1020,25 +1020,25 @@ def load_zone_aggression_signals():
     SELECT *,
         CASE
             WHEN aggression_type = 'BUY AGGRESSION'
-             AND UPPER(COALESCE(zone_state, '')) LIKE '%ABOVE STRONG SUPPLY%'
+             AND UPPER(COALESCE(zone_state, '')) LIKE '%%ABOVE STRONG SUPPLY%%'
                 THEN 'ABOVE STRONG SUPPLY + BUY AGGRESSION'
             WHEN aggression_type = 'SELL AGGRESSION'
              AND (
-                    UPPER(COALESCE(zone_state, '')) LIKE '%DEMAND%BROKEN%'
-                    OR UPPER(COALESCE(zone_state, '')) LIKE '%BELOW STRONG DEMAND%'
+                    UPPER(COALESCE(zone_state, '')) LIKE '%%DEMAND%%BROKEN%%'
+                    OR UPPER(COALESCE(zone_state, '')) LIKE '%%BELOW STRONG DEMAND%%'
                  )
                 THEN 'BELOW WEAK DEMAND + SELL AGGRESSION'
         END AS setup
     FROM aligned
     WHERE (
             aggression_type = 'BUY AGGRESSION'
-            AND UPPER(COALESCE(zone_state, '')) LIKE '%ABOVE STRONG SUPPLY%'
+            AND UPPER(COALESCE(zone_state, '')) LIKE '%%ABOVE STRONG SUPPLY%%'
           )
        OR (
             aggression_type = 'SELL AGGRESSION'
             AND (
-                   UPPER(COALESCE(zone_state, '')) LIKE '%DEMAND%BROKEN%'
-                   OR UPPER(COALESCE(zone_state, '')) LIKE '%BELOW STRONG DEMAND%'
+                   UPPER(COALESCE(zone_state, '')) LIKE '%%DEMAND%%BROKEN%%'
+                   OR UPPER(COALESCE(zone_state, '')) LIKE '%%BELOW STRONG DEMAND%%'
                 )
           )
     ORDER BY money_flow_rank, ts
