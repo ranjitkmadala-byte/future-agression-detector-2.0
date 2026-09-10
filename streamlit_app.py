@@ -957,6 +957,93 @@ def load_v2_aggression():
     FROM public.futures_aggression_snapshots WHERE trading_date=(SELECT trading_date FROM d)
     ORDER BY symbol,ts""")
 
+
+def load_zone_aggression_signals():
+    """Qualifying futures aggression aligned with the nearest liquidity-zone snapshot."""
+    if not aggression_table_exists():
+        return pd.DataFrame()
+
+    return query_df("""
+    WITH d AS (
+        SELECT MAX(trading_date) AS trading_date
+        FROM public.money_flow_universe
+    ),
+    universe AS (
+        SELECT trading_date, rank AS money_flow_rank, symbol
+        FROM public.money_flow_universe
+        WHERE trading_date = (SELECT trading_date FROM d)
+    ),
+    aggression AS (
+        SELECT
+            a.trading_date, a.symbol, a.ts, a.delta_pct,
+            a.price_change_3m_pct, a.oi_change_3m_pct,
+            a.aggressive_buy_qty, a.aggressive_sell_qty,
+            a.classified_trade_count,
+            CASE
+                WHEN a.delta_pct >= 30 AND a.price_change_3m_pct > 0
+                 AND a.oi_change_3m_pct > 0 THEN 'BUY AGGRESSION'
+                WHEN a.delta_pct <= -30 AND a.price_change_3m_pct < 0
+                 AND a.oi_change_3m_pct > 0 THEN 'SELL AGGRESSION'
+            END AS aggression_type
+        FROM public.futures_aggression_snapshots a
+        WHERE a.trading_date = (SELECT trading_date FROM d)
+          AND a.classified_trade_count >= 5
+          AND COALESCE(a.aggressive_buy_qty, 0)
+              + COALESCE(a.aggressive_sell_qty, 0) > 0
+          AND (
+                (a.delta_pct >= 30 AND a.price_change_3m_pct > 0 AND a.oi_change_3m_pct > 0)
+                OR
+                (a.delta_pct <= -30 AND a.price_change_3m_pct < 0 AND a.oi_change_3m_pct > 0)
+          )
+    ),
+    aligned AS (
+        SELECT
+            u.trading_date, u.money_flow_rank, u.symbol,
+            a.ts, a.aggression_type, a.delta_pct,
+            a.price_change_3m_pct, a.oi_change_3m_pct,
+            a.aggressive_buy_qty, a.aggressive_sell_qty,
+            a.classified_trade_count,
+            z.ts AS zone_source_ts, z.spot, z.zone_state, z.next_zone
+        FROM universe u
+        JOIN aggression a
+          ON a.trading_date = u.trading_date AND a.symbol = u.symbol
+        LEFT JOIN LATERAL (
+            SELECT s.ts, s.spot, s.zone_state, s.next_zone
+            FROM public.stock_engine_snapshots s
+            WHERE s.symbol = a.symbol
+              AND s.ts BETWEEN a.ts - INTERVAL '2 minutes'
+                           AND a.ts + INTERVAL '4 minutes'
+            ORDER BY ABS(EXTRACT(EPOCH FROM (s.ts - a.ts)))
+            LIMIT 1
+        ) z ON TRUE
+    )
+    SELECT *,
+        CASE
+            WHEN aggression_type = 'BUY AGGRESSION'
+             AND UPPER(COALESCE(zone_state, '')) LIKE '%ABOVE STRONG SUPPLY%'
+                THEN 'ABOVE STRONG SUPPLY + BUY AGGRESSION'
+            WHEN aggression_type = 'SELL AGGRESSION'
+             AND (
+                    UPPER(COALESCE(zone_state, '')) LIKE '%DEMAND%BROKEN%'
+                    OR UPPER(COALESCE(zone_state, '')) LIKE '%BELOW STRONG DEMAND%'
+                 )
+                THEN 'BELOW WEAK DEMAND + SELL AGGRESSION'
+        END AS setup
+    FROM aligned
+    WHERE (
+            aggression_type = 'BUY AGGRESSION'
+            AND UPPER(COALESCE(zone_state, '')) LIKE '%ABOVE STRONG SUPPLY%'
+          )
+       OR (
+            aggression_type = 'SELL AGGRESSION'
+            AND (
+                   UPPER(COALESCE(zone_state, '')) LIKE '%DEMAND%BROKEN%'
+                   OR UPPER(COALESCE(zone_state, '')) LIKE '%BELOW STRONG DEMAND%'
+                )
+          )
+    ORDER BY money_flow_rank, ts
+    """)
+
 def tail_count(vals,pred):
     n=0
     for v in reversed(list(vals)):
@@ -1461,6 +1548,7 @@ spurt_dominant_options = load_dominant_option_at_first_spurt() if not universe.e
 option_doubles = load_first_option_doubles() if not universe.empty else pd.DataFrame()
 v2_option_baskets = load_v2_option_baskets() if not universe.empty else pd.DataFrame()
 v2_aggression = load_v2_aggression() if not universe.empty else pd.DataFrame()
+zone_aggression_signals = load_zone_aggression_signals() if not universe.empty else pd.DataFrame()
 v2_board = build_v2_state(universe, v2_option_baskets, v2_aggression, milestones) if not universe.empty else pd.DataFrame()
 reversal_events = build_fast_reversal_events(
     v2_board.attrs.get("snapshot_history", pd.DataFrame())
@@ -1518,9 +1606,10 @@ if latest.empty:
         "Once the 3-minute collector starts writing, the two dashboards will populate automatically."
     )
 
-tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "v2.2 State", "Master", "OI Detector", "Option Lead",
-    "30-Day Monitor", "Liquidity", "Stock detail", "Fast Reversals"
+    "30-Day Monitor", "Liquidity", "Stock detail", "Fast Reversals",
+    "Zone + Aggression"
 ])
 
 # ---------------- v2.1 STATE + CONVICTION + MEMORY ----------------
@@ -2132,6 +2221,91 @@ with tab7:
         st.caption(
             "Peak Invalidated means the strong direction collapsed quickly but the opposite side "
             "did not yet achieve meaningful confirmation."
+        )
+
+
+# ---------------- ZONE + FUTURES AGGRESSION ----------------
+with tab8:
+    st.subheader("Zone + Futures Aggression")
+    st.caption(
+        "Highlights only two aligned conditions: Buy Aggression while price is above Strong "
+        "Supply, and Sell Aggression after Weak Demand has broken. Aggression is measured from "
+        "futures executions, futures price and futures OI."
+    )
+
+    if zone_aggression_signals.empty:
+        st.info("No qualifying Zone + Aggression setup has been recorded for this trading date.")
+    else:
+        signals = zone_aggression_signals.copy()
+        signals["ts"] = pd.to_datetime(signals["ts"], errors="coerce", utc=True)
+
+        bullish_name = "ABOVE STRONG SUPPLY + BUY AGGRESSION"
+        bearish_name = "BELOW WEAK DEMAND + SELL AGGRESSION"
+        bullish = signals[signals["setup"].eq(bullish_name)].copy()
+        bearish = signals[signals["setup"].eq(bearish_name)].copy()
+
+        z1, z2, z3 = st.columns(3)
+        z1.metric("Bullish setup stocks", int(bullish["symbol"].nunique()))
+        z2.metric("Bearish setup stocks", int(bearish["symbol"].nunique()))
+        z3.metric("Total qualifying events", int(len(signals)))
+
+        def setup_summary(frame):
+            if frame.empty:
+                return pd.DataFrame()
+
+            ordered = frame.sort_values(["symbol", "ts"]).copy()
+            first = ordered.groupby("symbol", as_index=False).first()
+            latest_rows = ordered.groupby("symbol", as_index=False).tail(1).copy()
+            counts = ordered.groupby("symbol").size().rename("event_count")
+            latest_rows = latest_rows.merge(
+                first[["symbol", "ts"]].rename(columns={"ts": "first_signal_ts"}),
+                on="symbol", how="left"
+            )
+            latest_rows = latest_rows.merge(counts, on="symbol", how="left")
+            latest_rows["first_signal_time"] = latest_rows["first_signal_ts"].apply(time_ist)
+            latest_rows["latest_signal_time"] = latest_rows["ts"].apply(time_ist)
+            return latest_rows.sort_values(["money_flow_rank", "symbol"])
+
+        display_columns = [
+            "money_flow_rank", "symbol", "first_signal_time", "latest_signal_time",
+            "event_count", "spot", "delta_pct", "price_change_3m_pct",
+            "oi_change_3m_pct", "classified_trade_count", "zone_state", "next_zone"
+        ]
+        display_config = {
+            "money_flow_rank": "MF Rank", "symbol": "Symbol",
+            "first_signal_time": "First Signal", "latest_signal_time": "Latest Signal",
+            "event_count": "Events",
+            "spot": st.column_config.NumberColumn("Spot", format="%.2f"),
+            "delta_pct": st.column_config.NumberColumn("Executed Delta %", format="%.1f"),
+            "price_change_3m_pct": st.column_config.NumberColumn("Fut Price 3m %", format="%.3f"),
+            "oi_change_3m_pct": st.column_config.NumberColumn("Fut OI 3m %", format="%.3f"),
+            "classified_trade_count": "Classified Trades",
+            "zone_state": "Zone State", "next_zone": "Next Zone"
+        }
+
+        st.markdown("#### Above Strong Supply + Buy Aggression")
+        bull_summary = setup_summary(bullish)
+        if bull_summary.empty:
+            st.info("No bullish aligned setup has been recorded today.")
+        else:
+            st.dataframe(
+                bull_summary[[c for c in display_columns if c in bull_summary.columns]],
+                width="stretch", hide_index=True, column_config=display_config
+            )
+
+        st.markdown("#### Below Weak Demand + Sell Aggression")
+        bear_summary = setup_summary(bearish)
+        if bear_summary.empty:
+            st.info("No bearish aligned setup has been recorded today.")
+        else:
+            st.dataframe(
+                bear_summary[[c for c in display_columns if c in bear_summary.columns]],
+                width="stretch", hide_index=True, column_config=display_config
+            )
+
+        st.caption(
+            "Each row shows the first and latest occurrence for the stock. Event count is the "
+            "number of qualifying three-minute futures-aggression snapshots in the same setup."
         )
 
 st.divider()
