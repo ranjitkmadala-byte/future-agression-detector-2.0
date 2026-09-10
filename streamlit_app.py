@@ -2466,17 +2466,40 @@ with tab9:
         buy_seq = seq[seq["sequence_type"].eq(buy_name)].copy()
         sell_seq = seq[seq["sequence_type"].eq(sell_name)].copy()
 
-        completed_buy = int(buy_seq["sequence_status"].eq("SEQUENCE COMPLETE").sum())
-        completed_sell = int(sell_seq["sequence_status"].eq("SEQUENCE COMPLETE").sum())
-        waiting = int(seq["sequence_status"].eq("WAITING").sum())
+        if not buy_seq.empty:
+            buy_seq["sequence_result"] = "NOT PASSED"
+            buy_seq.loc[buy_seq["sequence_status"].eq("WAITING"), "sequence_result"] = "WAITING"
+            buy_pass = (
+                buy_seq["sequence_status"].eq("SEQUENCE COMPLETE")
+                & pd.to_numeric(buy_seq["minutes_to_follow"], errors="coerce").le(30)
+                & pd.to_numeric(buy_seq["future_move_to_follow_pct"], errors="coerce").gt(0)
+            )
+            buy_seq.loc[buy_pass, "sequence_result"] = "PASSED"
+            buy_seq.loc[
+                buy_seq["sequence_status"].eq("SEQUENCE COMPLETE")
+                & pd.to_numeric(buy_seq["minutes_to_follow"], errors="coerce").gt(30),
+                "sequence_result"
+            ] = "NOT PASSED - LATE"
+            buy_seq.loc[
+                buy_seq["sequence_status"].eq("SEQUENCE COMPLETE")
+                & pd.to_numeric(buy_seq["minutes_to_follow"], errors="coerce").le(30)
+                & pd.to_numeric(buy_seq["future_move_to_follow_pct"], errors="coerce").le(0),
+                "sequence_result"
+            ] = "NOT PASSED - NO POSITIVE MOVE"
 
-        s1, s2, s3 = st.columns(3)
-        s1.metric("Buy → Short Cover complete", completed_buy)
-        s2.metric("Sell → Long Unwind complete", completed_sell)
-        s3.metric("Waiting for follow-through", waiting)
+        passed_buy = int(buy_seq["sequence_result"].eq("PASSED").sum()) if not buy_seq.empty else 0
+        not_passed_buy = int(buy_seq["sequence_result"].str.startswith("NOT PASSED").sum()) if not buy_seq.empty else 0
+        completed_sell = int(sell_seq["sequence_status"].eq("SEQUENCE COMPLETE").sum())
+        waiting_buy = int(buy_seq["sequence_result"].eq("WAITING").sum()) if not buy_seq.empty else 0
+
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Buy sequence passed", passed_buy)
+        s2.metric("Buy sequence not passed", not_passed_buy)
+        s3.metric("Buy sequence waiting", waiting_buy)
+        s4.metric("Sell sequence complete", completed_sell)
 
         sequence_columns = [
-            "money_flow_rank", "symbol", "sequence_status", "timing_bucket",
+            "money_flow_rank", "symbol", "sequence_result", "sequence_status", "timing_bucket",
             "first_aggression_time", "follow_through_time", "minutes_to_follow",
             "start_future", "follow_future", "future_move_to_follow_pct",
             "start_delta_pct", "start_price_change_3m_pct", "start_oi_change_3m_pct",
@@ -2484,6 +2507,7 @@ with tab9:
         ]
         sequence_config = {
             "money_flow_rank": "MF Rank", "symbol": "Symbol",
+            "sequence_result": "Result",
             "sequence_status": "Status", "timing_bucket": "Timing",
             "first_aggression_time": "First Aggression",
             "follow_through_time": "First Follow-Through",
@@ -2499,14 +2523,37 @@ with tab9:
             "follow_oi_change_3m_pct": st.column_config.NumberColumn("Follow OI 3m %", format="%.3f")
         }
 
-        st.markdown("#### Buy Aggression → Short Covering")
+        st.markdown("#### Passed: Buy Aggression → Short Covering")
+        st.caption(
+            "Pass rule: Short Covering occurs within 30 minutes and futures remain above the "
+            "initial Buy Aggression price."
+        )
         if buy_seq.empty:
             st.info("No Fresh Buy Aggression has been recorded today.")
         else:
-            st.dataframe(
-                buy_seq[[c for c in sequence_columns if c in buy_seq.columns]],
-                width="stretch", hide_index=True, column_config=sequence_config
+            passed = buy_seq[buy_seq["sequence_result"].eq("PASSED")].sort_values(
+                ["minutes_to_follow", "future_move_to_follow_pct"], ascending=[True, False]
             )
+            not_passed = buy_seq[~buy_seq["sequence_result"].eq("PASSED")].sort_values(
+                ["sequence_result", "minutes_to_follow"], na_position="last"
+            )
+
+            if passed.empty:
+                st.info("No stock has passed the Buy Aggression sequence today.")
+            else:
+                st.dataframe(
+                    passed[[c for c in sequence_columns if c in passed.columns]],
+                    width="stretch", hide_index=True, column_config=sequence_config
+                )
+
+            with st.expander("Not passed / waiting", expanded=False):
+                if not_passed.empty:
+                    st.info("No failed or waiting Buy Aggression sequence.")
+                else:
+                    st.dataframe(
+                        not_passed[[c for c in sequence_columns if c in not_passed.columns]],
+                        width="stretch", hide_index=True, column_config=sequence_config
+                    )
 
         st.markdown("#### Sell Aggression → Long Unwinding")
         if sell_seq.empty:
