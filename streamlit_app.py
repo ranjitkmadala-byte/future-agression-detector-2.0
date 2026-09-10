@@ -1044,6 +1044,139 @@ def load_zone_aggression_signals():
     ORDER BY money_flow_rank, ts
     """)
 
+
+def load_aggression_followthrough_sequences():
+    """First fresh aggression followed later by covering/unwinding, without zone filters."""
+    if not aggression_table_exists():
+        return pd.DataFrame()
+
+    return query_df("""
+    WITH d AS (
+        SELECT MAX(trading_date) AS trading_date
+        FROM public.money_flow_universe
+    ),
+    universe AS (
+        SELECT trading_date, rank AS money_flow_rank, symbol
+        FROM public.money_flow_universe
+        WHERE trading_date = (SELECT trading_date FROM d)
+    ),
+    events AS (
+        SELECT
+            a.*,
+            (
+                a.classified_trade_count >= 5
+                AND COALESCE(a.aggressive_buy_qty, 0)
+                    + COALESCE(a.aggressive_sell_qty, 0) > 0
+            ) AS eligible
+        FROM public.futures_aggression_snapshots a
+        WHERE a.trading_date = (SELECT trading_date FROM d)
+    ),
+    firsts AS (
+        SELECT
+            symbol,
+            MIN(ts) FILTER (
+                WHERE eligible
+                  AND delta_pct >= 30
+                  AND price_change_3m_pct > 0
+                  AND oi_change_3m_pct > 0
+            ) AS first_buy_ts,
+            MIN(ts) FILTER (
+                WHERE eligible
+                  AND delta_pct <= -30
+                  AND price_change_3m_pct < 0
+                  AND oi_change_3m_pct > 0
+            ) AS first_sell_ts
+        FROM events
+        GROUP BY symbol
+    ),
+    starts AS (
+        SELECT u.trading_date, u.money_flow_rank, u.symbol,
+               'BUY AGGRESSION TO SHORT COVERING'::text AS sequence_type,
+               f.first_buy_ts AS start_ts
+        FROM universe u
+        LEFT JOIN firsts f USING (symbol)
+        WHERE f.first_buy_ts IS NOT NULL
+
+        UNION ALL
+
+        SELECT u.trading_date, u.money_flow_rank, u.symbol,
+               'SELL AGGRESSION TO LONG UNWINDING'::text AS sequence_type,
+               f.first_sell_ts AS start_ts
+        FROM universe u
+        LEFT JOIN firsts f USING (symbol)
+        WHERE f.first_sell_ts IS NOT NULL
+    )
+    SELECT
+        s.trading_date,
+        s.money_flow_rank,
+        s.symbol,
+        s.sequence_type,
+        s.start_ts,
+        start_event.delta_pct AS start_delta_pct,
+        start_event.price_change_3m_pct AS start_price_change_3m_pct,
+        start_event.oi_change_3m_pct AS start_oi_change_3m_pct,
+        start_event.classified_trade_count AS start_classified_trades,
+        start_price.future AS start_future,
+        follow_event.ts AS follow_ts,
+        follow_event.delta_pct AS follow_delta_pct,
+        follow_event.price_change_3m_pct AS follow_price_change_3m_pct,
+        follow_event.oi_change_3m_pct AS follow_oi_change_3m_pct,
+        follow_event.classified_trade_count AS follow_classified_trades,
+        follow_price.future AS follow_future,
+        CASE WHEN follow_event.ts IS NOT NULL
+             THEN EXTRACT(EPOCH FROM (follow_event.ts - s.start_ts)) / 60.0
+        END AS minutes_to_follow,
+        CASE WHEN start_price.future IS NOT NULL AND follow_price.future IS NOT NULL
+             THEN ((follow_price.future / NULLIF(start_price.future, 0)) - 1) * 100
+        END AS future_move_to_follow_pct,
+        CASE WHEN follow_event.ts IS NULL THEN 'WAITING' ELSE 'SEQUENCE COMPLETE' END AS sequence_status,
+        CASE
+            WHEN follow_event.ts IS NULL THEN 'WAITING'
+            WHEN EXTRACT(EPOCH FROM (follow_event.ts - s.start_ts)) / 60.0 <= 15 THEN 'FAST 0-15M'
+            WHEN EXTRACT(EPOCH FROM (follow_event.ts - s.start_ts)) / 60.0 <= 30 THEN 'STRONG 16-30M'
+            WHEN EXTRACT(EPOCH FROM (follow_event.ts - s.start_ts)) / 60.0 <= 60 THEN 'DEVELOPING 31-60M'
+            ELSE 'LATE 60M+'
+        END AS timing_bucket
+    FROM starts s
+    JOIN events start_event
+      ON start_event.symbol = s.symbol AND start_event.ts = s.start_ts
+    LEFT JOIN LATERAL (
+        SELECT e.*
+        FROM events e
+        WHERE e.symbol = s.symbol
+          AND e.ts > s.start_ts
+          AND (
+                (s.sequence_type = 'BUY AGGRESSION TO SHORT COVERING'
+                 AND e.price_change_3m_pct > 0 AND e.oi_change_3m_pct < 0)
+                OR
+                (s.sequence_type = 'SELL AGGRESSION TO LONG UNWINDING'
+                 AND e.price_change_3m_pct < 0 AND e.oi_change_3m_pct < 0)
+              )
+        ORDER BY e.ts
+        LIMIT 1
+    ) follow_event ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT x.future
+        FROM public.stock_engine_snapshots x
+        WHERE x.symbol = s.symbol
+          AND x.ts BETWEEN s.start_ts - INTERVAL '2 minutes'
+                       AND s.start_ts + INTERVAL '4 minutes'
+        ORDER BY ABS(EXTRACT(EPOCH FROM (x.ts - s.start_ts)))
+        LIMIT 1
+    ) start_price ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT x.future
+        FROM public.stock_engine_snapshots x
+        WHERE x.symbol = s.symbol
+          AND follow_event.ts IS NOT NULL
+          AND x.ts BETWEEN follow_event.ts - INTERVAL '2 minutes'
+                       AND follow_event.ts + INTERVAL '4 minutes'
+        ORDER BY ABS(EXTRACT(EPOCH FROM (x.ts - follow_event.ts)))
+        LIMIT 1
+    ) follow_price ON TRUE
+    ORDER BY s.sequence_type, s.money_flow_rank
+    """)
+
 def tail_count(vals,pred):
     n=0
     for v in reversed(list(vals)):
@@ -1549,6 +1682,7 @@ option_doubles = load_first_option_doubles() if not universe.empty else pd.DataF
 v2_option_baskets = load_v2_option_baskets() if not universe.empty else pd.DataFrame()
 v2_aggression = load_v2_aggression() if not universe.empty else pd.DataFrame()
 zone_aggression_signals = load_zone_aggression_signals() if not universe.empty else pd.DataFrame()
+aggression_sequences = load_aggression_followthrough_sequences() if not universe.empty else pd.DataFrame()
 v2_board = build_v2_state(universe, v2_option_baskets, v2_aggression, milestones) if not universe.empty else pd.DataFrame()
 reversal_events = build_fast_reversal_events(
     v2_board.attrs.get("snapshot_history", pd.DataFrame())
@@ -1606,10 +1740,10 @@ if latest.empty:
         "Once the 3-minute collector starts writing, the two dashboards will populate automatically."
     )
 
-tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+tab0, tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     "v2.2 State", "Master", "OI Detector", "Option Lead",
     "30-Day Monitor", "Liquidity", "Stock detail", "Fast Reversals",
-    "Zone + Aggression"
+    "Zone + Aggression", "Aggression Sequence"
 ])
 
 # ---------------- v2.1 STATE + CONVICTION + MEMORY ----------------
@@ -2306,6 +2440,87 @@ with tab8:
         st.caption(
             "Each row shows the first and latest occurrence for the stock. Event count is the "
             "number of qualifying three-minute futures-aggression snapshots in the same setup."
+        )
+
+
+# ---------------- AGGRESSION FOLLOW-THROUGH SEQUENCES ----------------
+with tab9:
+    st.subheader("Aggression Follow-Through Sequence")
+    st.caption(
+        "Tracks sequence only; liquidity zones are not used. Bullish sequence: first Fresh Buy "
+        "Aggression followed by Short Covering. Bearish sequence: first Fresh Sell Aggression "
+        "followed by Long Unwinding."
+    )
+
+    if aggression_sequences.empty:
+        st.info("No qualifying fresh Buy or Sell Aggression has been recorded for this trading date.")
+    else:
+        seq = aggression_sequences.copy()
+        for c in ["start_ts", "follow_ts"]:
+            seq[c] = pd.to_datetime(seq[c], errors="coerce", utc=True)
+        seq["first_aggression_time"] = seq["start_ts"].apply(time_ist)
+        seq["follow_through_time"] = seq["follow_ts"].apply(time_ist)
+
+        buy_name = "BUY AGGRESSION TO SHORT COVERING"
+        sell_name = "SELL AGGRESSION TO LONG UNWINDING"
+        buy_seq = seq[seq["sequence_type"].eq(buy_name)].copy()
+        sell_seq = seq[seq["sequence_type"].eq(sell_name)].copy()
+
+        completed_buy = int(buy_seq["sequence_status"].eq("SEQUENCE COMPLETE").sum())
+        completed_sell = int(sell_seq["sequence_status"].eq("SEQUENCE COMPLETE").sum())
+        waiting = int(seq["sequence_status"].eq("WAITING").sum())
+
+        s1, s2, s3 = st.columns(3)
+        s1.metric("Buy → Short Cover complete", completed_buy)
+        s2.metric("Sell → Long Unwind complete", completed_sell)
+        s3.metric("Waiting for follow-through", waiting)
+
+        sequence_columns = [
+            "money_flow_rank", "symbol", "sequence_status", "timing_bucket",
+            "first_aggression_time", "follow_through_time", "minutes_to_follow",
+            "start_future", "follow_future", "future_move_to_follow_pct",
+            "start_delta_pct", "start_price_change_3m_pct", "start_oi_change_3m_pct",
+            "follow_delta_pct", "follow_price_change_3m_pct", "follow_oi_change_3m_pct"
+        ]
+        sequence_config = {
+            "money_flow_rank": "MF Rank", "symbol": "Symbol",
+            "sequence_status": "Status", "timing_bucket": "Timing",
+            "first_aggression_time": "First Aggression",
+            "follow_through_time": "First Follow-Through",
+            "minutes_to_follow": st.column_config.NumberColumn("Minutes", format="%.0f"),
+            "start_future": st.column_config.NumberColumn("Future at Aggression", format="%.2f"),
+            "follow_future": st.column_config.NumberColumn("Future at Follow-Through", format="%.2f"),
+            "future_move_to_follow_pct": st.column_config.NumberColumn("Future Move %", format="%.2f"),
+            "start_delta_pct": st.column_config.NumberColumn("Start Delta %", format="%.1f"),
+            "start_price_change_3m_pct": st.column_config.NumberColumn("Start Price 3m %", format="%.3f"),
+            "start_oi_change_3m_pct": st.column_config.NumberColumn("Start OI 3m %", format="%.3f"),
+            "follow_delta_pct": st.column_config.NumberColumn("Follow Delta %", format="%.1f"),
+            "follow_price_change_3m_pct": st.column_config.NumberColumn("Follow Price 3m %", format="%.3f"),
+            "follow_oi_change_3m_pct": st.column_config.NumberColumn("Follow OI 3m %", format="%.3f")
+        }
+
+        st.markdown("#### Buy Aggression → Short Covering")
+        if buy_seq.empty:
+            st.info("No Fresh Buy Aggression has been recorded today.")
+        else:
+            st.dataframe(
+                buy_seq[[c for c in sequence_columns if c in buy_seq.columns]],
+                width="stretch", hide_index=True, column_config=sequence_config
+            )
+
+        st.markdown("#### Sell Aggression → Long Unwinding")
+        if sell_seq.empty:
+            st.info("No Fresh Sell Aggression has been recorded today.")
+        else:
+            st.dataframe(
+                sell_seq[[c for c in sequence_columns if c in sell_seq.columns]],
+                width="stretch", hide_index=True, column_config=sequence_config
+            )
+
+        st.caption(
+            "The follow-through stage uses futures price and OI only: price up + OI down is "
+            "Short Covering; price down + OI down is Long Unwinding. Executed delta remains "
+            "visible as supporting evidence but is not required for the second stage."
         )
 
 st.divider()
