@@ -1016,6 +1016,8 @@ def load_v2_aggression():
     ORDER BY symbol,ts""")
     if out.empty:
         return out
+    for col in ["session_price_pct","cumulative_oi_pct","volume_traded","volume_930"]:
+        out[col]=pd.to_numeric(out[col],errors="coerce").astype(float)
     out["volume_since_930"]=(pd.to_numeric(out["volume_traded"],errors="coerce")-
                               pd.to_numeric(out["volume_930"],errors="coerce")).clip(lower=0)
     out["market_session_pct"]=out.groupby("ts")["session_price_pct"].transform("median")
