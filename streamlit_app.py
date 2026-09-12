@@ -105,6 +105,8 @@ def ensure_early_detector_snapshots_table():
         order_flow_agreement TEXT NOT NULL,
         price_change_3m_pct NUMERIC,
         oi_change_3m_pct NUMERIC,
+        session_price_pct NUMERIC,
+        cumulative_oi_pct NUMERIC,
         absorption_flag TEXT,
         minutes_2_to_4 NUMERIC,
         option_source_ts TIMESTAMPTZ,
@@ -117,6 +119,11 @@ def ensure_early_detector_snapshots_table():
 
     CREATE INDEX IF NOT EXISTS idx_early_detector_date_symbol_ts
         ON public.early_detector_snapshots (trading_date, symbol, ts);
+
+    ALTER TABLE public.early_detector_snapshots
+        ADD COLUMN IF NOT EXISTS session_price_pct NUMERIC;
+    ALTER TABLE public.early_detector_snapshots
+        ADD COLUMN IF NOT EXISTS cumulative_oi_pct NUMERIC;
     """
     with psycopg.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
@@ -137,7 +144,8 @@ def persist_early_detector_snapshots(history_df):
         "total_qty_imbalance", "imbalance_persistence", "trade_delta_pct",
         "classified_trade_count", "classified_qty", "delta_persistence",
         "aggression_quality", "order_flow_agreement", "price_change_3m_pct",
-        "oi_change_3m_pct", "absorption_flag", "minutes_2_to_4",
+        "oi_change_3m_pct", "session_price_pct", "cumulative_oi_pct",
+        "absorption_flag", "minutes_2_to_4",
         "option_source_ts", "aggression_source_ts"
     ]
 
@@ -952,9 +960,17 @@ def load_v2_aggression():
     if not aggression_table_exists(): return pd.DataFrame()
     return query_df("""
     WITH d AS (SELECT MAX(trading_date) trading_date FROM public.money_flow_universe)
-    SELECT symbol,ts,delta_pct,total_qty_imbalance,price_change_3m_pct,oi_change_3m_pct,
-           aggressive_buy_qty,aggressive_sell_qty,classified_trade_count
-    FROM public.futures_aggression_snapshots WHERE trading_date=(SELECT trading_date FROM d)
+    SELECT a.symbol,a.ts,a.delta_pct,a.total_qty_imbalance,
+           a.price_change_3m_pct,a.oi_change_3m_pct,
+           COALESCE(a.price_change_t0_pct,
+                    (a.ltp/NULLIF(u.future_price,0)-1)*100) AS session_price_pct,
+           COALESCE(a.oi_change_t0_pct,
+                    (a.open_interest/NULLIF(u.future_oi,0)-1)*100) AS cumulative_oi_pct,
+           a.aggressive_buy_qty,a.aggressive_sell_qty,a.classified_trade_count
+    FROM public.futures_aggression_snapshots a
+    JOIN public.money_flow_universe u
+      ON u.trading_date=a.trading_date AND u.symbol=a.symbol
+    WHERE a.trading_date=(SELECT trading_date FROM d)
     ORDER BY symbol,ts""")
 
 
@@ -1215,14 +1231,24 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
 
     def opt_pts(score, persist):
         pts = 3 if score >= 6 else 2.5 if score >= 5 else 2 if score >= 4 else 1 if score >= 3 else 0
-        return min(3, pts + (0.5 if persist >= 3 else 0))
+        # Persistence is an independent point; the former min(3) cap erased it.
+        return min(4, pts + (1 if persist >= 3 else 0))
 
-    def classify_state(bull, bear, imb, px, td, delta_eligible, m24):
+    def session_pts(value):
+        if pd.isna(value):
+            return 0
+        move = abs(float(value))
+        return 2 if move >= 0.50 else 1 if move >= 0.25 else 0
+
+    def classify_state(bull, bear, imb, px, td, delta_eligible, m24,
+                       bo, so, session_px):
         bull = min(10, float(bull))
         bear = min(10, float(bear))
         direction = "BULL" if bull > bear else "BEAR" if bear > bull else "MIXED"
         score = max(bull, bear)
         conflict = bull >= 4 and bear >= 4
+        structural_bull = pd.notna(session_px) and session_px >= 0.50 and bo >= 5 and so <= 1
+        structural_bear = pd.notna(session_px) and session_px <= -0.50 and so >= 5 and bo <= 1
 
         absorption = None
         if pd.notna(px):
@@ -1235,7 +1261,11 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
 
         if conflict:
             return "CONFLICT", "CONFLICT", score, direction, absorption
-        if absorption and score < 8:
+        if structural_bull and ((pd.notna(px) and px <= 0.05) or (pd.notna(imb) and imb < 0)):
+            return "BULLISH CONSOLIDATION", "HIGH", score, direction, absorption
+        if structural_bear and ((pd.notna(px) and px >= -0.05) or (pd.notna(imb) and imb > 0)):
+            return "BEARISH CONSOLIDATION", "HIGH", score, direction, absorption
+        if absorption and score < 6:
             return absorption, "WARNING", score, direction, absorption
         if score >= 8:
             if pd.notna(m24) and m24 <= 30:
@@ -1262,7 +1292,7 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
             bp = tail_count(og["bull_option_score"], lambda x: x >= 5)
             sp = tail_count(og["bear_option_score"], lambda x: x >= 5)
 
-        imb = px = oi = td = None
+        imb = px = oi = td = session_px = cumoi = None
         classified_trades = classified_qty = 0
         buy_p = sell_p = long_p = short_p = delta_buy_p = delta_sell_p = 0
         delta_eligible = False
@@ -1275,6 +1305,8 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
             imb = pd.to_numeric(a.get("total_qty_imbalance"), errors="coerce")
             px = pd.to_numeric(a.get("price_change_3m_pct"), errors="coerce")
             oi = pd.to_numeric(a.get("oi_change_3m_pct"), errors="coerce")
+            session_px = pd.to_numeric(a.get("session_price_pct"), errors="coerce")
+            cumoi = pd.to_numeric(a.get("cumulative_oi_pct"), errors="coerce")
             td = pd.to_numeric(a.get("delta_pct"), errors="coerce")
             classified_trades_raw = pd.to_numeric(a.get("classified_trade_count"), errors="coerce")
             classified_trades = 0 if pd.isna(classified_trades_raw) else int(classified_trades_raw)
@@ -1332,16 +1364,38 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
                 bear += 2 if delta_sell_p >= 2 else 1
 
         if pd.notna(px):
-            if px > 0:
-                bull += 2 if long_p >= 2 else 1
-            elif px < 0:
-                bear += 2 if short_p >= 2 else 1
+            if px > 0.05:
+                bull += 1
+            elif px < -0.05:
+                bear += 1
 
-        if pd.notna(oi) and oi > 0 and pd.notna(px):
+        if pd.notna(oi) and oi >= 0.10 and pd.notna(px):
             if px > 0:
-                bull += 2 if long_p >= 2 else 1
+                bull += 1
             elif px < 0:
-                bear += 2 if short_p >= 2 else 1
+                bear += 1
+
+        # Cumulative session movement from the frozen 09:30 baseline.
+        smp = session_pts(session_px)
+        if pd.notna(session_px):
+            if session_px > 0:
+                bull += smp
+            elif session_px < 0:
+                bear += smp
+
+        # Strong option breadth aligned with a >=0.50% stock move.
+        if pd.notna(session_px) and session_px >= 0.50 and bo >= 5:
+            bull += 1
+        elif pd.notna(session_px) and session_px <= -0.50 and so >= 5:
+            bear += 1
+
+        # +/-1% cumulative futures OI is neutral. Positive buildup beyond 1%
+        # confirms the direction of the cumulative price move.
+        if pd.notna(cumoi) and cumoi >= 1 and pd.notna(session_px):
+            if session_px > 0:
+                bull += 1
+            elif session_px < 0:
+                bear += 1
 
         m24 = pd.to_numeric(m.get("minutes_2_to_4"), errors="coerce") if m is not None else None
         t4 = m.get("time_4pct") if m is not None else pd.NaT
@@ -1358,7 +1412,7 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
                     bear += 1
 
         state, conviction, score, direction, absorption = classify_state(
-            bull, bear, imb, px, td, delta_eligible, m24
+            bull, bear, imb, px, td, delta_eligible, m24, bo, so, session_px
         )
         return {
             "ts": ts, "bull": min(10, bull), "bear": min(10, bear),
@@ -1370,6 +1424,8 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
             "imbalance_persistence": max(buy_p, sell_p),
             "price_change_3m_pct": px,
             "oi_change_3m_pct": oi,
+            "session_price_pct": session_px,
+            "cumulative_oi_pct": cumoi,
             "trade_delta_pct": td,
             "classified_trade_count": classified_trades,
             "classified_qty": classified_qty,
@@ -1448,6 +1504,7 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
                 "bull":0.0,"bear":0.0,"option_bull_score":0,"option_bear_score":0,
                 "option_persistence":0,"total_qty_imbalance":None,"imbalance_persistence":0,
                 "price_change_3m_pct":None,"oi_change_3m_pct":None,"trade_delta_pct":None,
+                "session_price_pct":None,"cumulative_oi_pct":None,
                 "classified_trade_count":0,"classified_qty":0,"delta_persistence":0,
                 "aggression_quality":"NO DATA","order_flow_agreement":"NO DATA"
             }
@@ -1525,6 +1582,8 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
             "imbalance_persistence": current.get("imbalance_persistence",0),
             "price_change_3m_pct": current.get("price_change_3m_pct"),
             "oi_change_3m_pct": current.get("oi_change_3m_pct"),
+            "session_price_pct": current.get("session_price_pct"),
+            "cumulative_oi_pct": current.get("cumulative_oi_pct"),
             "trade_delta_pct": current.get("trade_delta_pct"),
             "classified_trade_count": current.get("classified_trade_count",0),
             "classified_qty": current.get("classified_qty",0),
@@ -1668,7 +1727,7 @@ def build_fast_reversal_events(history_df):
 # UI
 # ============================================================
 
-st.title("Top 20 Money Flow — Early Detector v2.2")
+st.title("Top 20 Money Flow — Early Detector v2.3")
 st.caption("State + Conviction • Options → Executed Delta → Order Book → Price Response → Futures OI → Acceleration.")
 
 universe = load_universe()
@@ -1753,7 +1812,7 @@ with tab0:
             "Futures aggression is unavailable for the current universe date. "
             "Scores are option-only and should not be compared with fully confirmed scores."
         )
-    st.subheader("Early Detector v2.1 — Current + Peak State")
+    st.subheader("Early Detector v2.3 — Current + Peak State")
     st.caption("Current state shows what is happening now. Peak state remembers the strongest clean intraday signal and when it occurred.")
 
     if v2_board.empty:
@@ -1789,6 +1848,7 @@ with tab0:
             "total_qty_imbalance","imbalance_persistence",
             "trade_delta_pct","classified_trade_count","classified_qty",
             "delta_persistence","aggression_quality","order_flow_agreement",
+            "session_price_pct","cumulative_oi_pct",
             "price_change_3m_pct","oi_change_3m_pct",
             "minutes_2_to_4","time_2pct","time_4pct"
         ]
@@ -1823,6 +1883,8 @@ with tab0:
                 "delta_persistence":"Delta Persist",
                 "aggression_quality":"Delta Quality",
                 "order_flow_agreement":"Book–Trade Agreement",
+                "session_price_pct":st.column_config.NumberColumn("Fut vs 09:30 %",format="%.3f"),
+                "cumulative_oi_pct":st.column_config.NumberColumn("Cum OI vs 09:30 %",format="%.3f"),
                 "price_change_3m_pct":st.column_config.NumberColumn("Fut Price 3m %",format="%.3f"),
                 "oi_change_3m_pct":st.column_config.NumberColumn("Fut OI 3m %",format="%.3f"),
                 "minutes_2_to_4":st.column_config.NumberColumn("OI 2→4 min",format="%.0f"),
@@ -1834,7 +1896,7 @@ with tab0:
         st.markdown("#### v2.2 executed-aggression logic")
         st.caption(
             "Current State = latest structure. Peak State Today = strongest clean directional state seen intraday. "
-            "Reversal = a meaningful bull↔bear flip after score ≥4. Absorption remains a warning when imbalance and price response disagree."
+            "Reversal = a meaningful bull↔bear flip after score ≥4. Session price and cumulative OI use the frozen 09:30 baseline; ±1% cumulative OI is neutral."
         )
         st.caption("Research dashboard only; state and conviction are analytical labels, not trade recommendations.")
 
