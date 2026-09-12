@@ -976,7 +976,6 @@ def load_v2_aggression():
         FROM public.stock_engine_snapshots e
         WHERE e.symbol=a.symbol
           AND (e.ts AT TIME ZONE 'Asia/Kolkata')::date=a.trading_date
-          AND e.ts BETWEEN a.ts-INTERVAL '4 minutes' AND a.ts+INTERVAL '90 seconds'
         ORDER BY ABS(EXTRACT(EPOCH FROM (e.ts-a.ts)))
         LIMIT 1
     ) s ON TRUE
@@ -1755,7 +1754,7 @@ def build_fast_reversal_events(history_df):
 # UI
 # ============================================================
 
-st.title("Top 20 Money Flow — Early Detector v2.4")
+st.title("Top 20 Money Flow — Early Detector v2.5")
 st.caption("State + Conviction • Options → Executed Delta → Order Book → Price Response → Futures OI → Acceleration.")
 
 universe = load_universe()
@@ -1840,7 +1839,7 @@ with tab0:
             "Futures aggression is unavailable for the current universe date. "
             "Scores are option-only and should not be compared with fully confirmed scores."
         )
-    st.subheader("Early Detector v2.4 — Current + Peak State")
+    st.subheader("Early Detector v2.5 — Current + Peak State")
     st.caption("Current state shows what is happening now. Peak state remembers the strongest clean intraday signal and when it occurred.")
 
     if v2_board.empty:
