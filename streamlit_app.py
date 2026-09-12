@@ -962,12 +962,24 @@ def load_v2_aggression():
     WITH d AS (SELECT MAX(trading_date) trading_date FROM public.money_flow_universe)
     SELECT a.symbol,a.ts,a.delta_pct,a.total_qty_imbalance,
            a.price_change_3m_pct,a.oi_change_3m_pct,
-           (a.ltp/NULLIF(u.future_price,0)-1)*100 AS session_price_pct,
-           (a.open_interest/NULLIF(u.future_oi,0)-1)*100 AS cumulative_oi_pct,
+           (COALESCE(s.future,a.ltp)/NULLIF(u.future_price,0)-1)*100 AS session_price_pct,
+           COALESCE(
+               s.future_oi_change_pct_t0,
+               (s.future_oi/NULLIF(u.future_oi,0)-1)*100
+           ) AS cumulative_oi_pct,
            a.aggressive_buy_qty,a.aggressive_sell_qty,a.classified_trade_count
     FROM public.futures_aggression_snapshots a
     JOIN public.money_flow_universe u
       ON u.trading_date=a.trading_date AND u.symbol=a.symbol
+    LEFT JOIN LATERAL (
+        SELECT e.future,e.future_oi,e.future_oi_change_pct_t0
+        FROM public.stock_engine_snapshots e
+        WHERE e.symbol=a.symbol
+          AND (e.ts AT TIME ZONE 'Asia/Kolkata')::date=a.trading_date
+          AND e.ts BETWEEN a.ts-INTERVAL '4 minutes' AND a.ts+INTERVAL '90 seconds'
+        ORDER BY ABS(EXTRACT(EPOCH FROM (e.ts-a.ts)))
+        LIMIT 1
+    ) s ON TRUE
     WHERE a.trading_date=(SELECT trading_date FROM d)
     ORDER BY symbol,ts""")
 
@@ -1522,21 +1534,39 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
             peak_score = float(peak["score"])
             peak_time = peak["ts"]
 
-            # Reversal = first meaningful direction flip after a prior meaningful opposite state.
+            # Reversal requires an opposite clean score >=6 to persist for at
+            # least three minutes. The previous >=4 single-row rule reacted to
+            # transient option/order-flow noise and overcounted reversals.
             reversal = False
             reversal_time = pd.NaT
-            last_meaningful_dir = None
+            established_dir = None
+            opposite_dir = None
+            opposite_since = pd.NaT
             for _, hr in hdf.iterrows():
                 d = hr["direction"]
                 sc = float(hr["score"])
-                if d not in ("BULL","BEAR") or sc < 4:
+                clean_state = hr["state"] not in ("CONFLICT","SELL ABSORPTION","BUY ABSORPTION")
+                if d not in ("BULL","BEAR") or sc < 6 or not clean_state:
                     continue
-                if last_meaningful_dir is None:
-                    last_meaningful_dir = d
-                elif d != last_meaningful_dir:
+                if established_dir is None:
+                    established_dir = d
+                    continue
+                if d == established_dir:
+                    opposite_dir = None
+                    opposite_since = pd.NaT
+                    continue
+                if opposite_dir != d:
+                    opposite_dir = d
+                    opposite_since = hr["ts"]
+                    continue
+                elapsed = (pd.Timestamp(hr["ts"])-pd.Timestamp(opposite_since)).total_seconds()/60.0
+                if elapsed >= 3:
                     reversal = True
                     reversal_time = hr["ts"]
-                    last_meaningful_dir = d
+                    established_dir = d
+                    opposite_dir = None
+                    opposite_since = pd.NaT
+                    break
 
         current_dir = current.get("direction", "MIXED")
         direction_clues = []
@@ -1725,7 +1755,7 @@ def build_fast_reversal_events(history_df):
 # UI
 # ============================================================
 
-st.title("Top 20 Money Flow — Early Detector v2.3")
+st.title("Top 20 Money Flow — Early Detector v2.4")
 st.caption("State + Conviction • Options → Executed Delta → Order Book → Price Response → Futures OI → Acceleration.")
 
 universe = load_universe()
@@ -1810,7 +1840,7 @@ with tab0:
             "Futures aggression is unavailable for the current universe date. "
             "Scores are option-only and should not be compared with fully confirmed scores."
         )
-    st.subheader("Early Detector v2.3 — Current + Peak State")
+    st.subheader("Early Detector v2.4 — Current + Peak State")
     st.caption("Current state shows what is happening now. Peak state remembers the strongest clean intraday signal and when it occurred.")
 
     if v2_board.empty:
