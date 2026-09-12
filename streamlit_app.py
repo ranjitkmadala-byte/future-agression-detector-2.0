@@ -962,10 +962,8 @@ def load_v2_aggression():
     WITH d AS (SELECT MAX(trading_date) trading_date FROM public.money_flow_universe)
     SELECT a.symbol,a.ts,a.delta_pct,a.total_qty_imbalance,
            a.price_change_3m_pct,a.oi_change_3m_pct,
-           COALESCE(a.price_change_t0_pct,
-                    (a.ltp/NULLIF(u.future_price,0)-1)*100) AS session_price_pct,
-           COALESCE(a.oi_change_t0_pct,
-                    (a.open_interest/NULLIF(u.future_oi,0)-1)*100) AS cumulative_oi_pct,
+           (a.ltp/NULLIF(u.future_price,0)-1)*100 AS session_price_pct,
+           (a.open_interest/NULLIF(u.future_oi,0)-1)*100 AS cumulative_oi_pct,
            a.aggressive_buy_qty,a.aggressive_sell_qty,a.classified_trade_count
     FROM public.futures_aggression_snapshots a
     JOIN public.money_flow_universe u
