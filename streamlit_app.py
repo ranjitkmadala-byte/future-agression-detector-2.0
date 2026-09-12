@@ -1,4 +1,5 @@
 import os
+import math
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -107,6 +108,11 @@ def ensure_early_detector_snapshots_table():
         oi_change_3m_pct NUMERIC,
         session_price_pct NUMERIC,
         cumulative_oi_pct NUMERIC,
+        normalized_move_units NUMERIC,
+        option_oi_iv_confirmation NUMERIC,
+        relative_strength_pct NUMERIC,
+        volume_percentile NUMERIC,
+        extension_status TEXT,
         absorption_flag TEXT,
         minutes_2_to_4 NUMERIC,
         option_source_ts TIMESTAMPTZ,
@@ -124,6 +130,16 @@ def ensure_early_detector_snapshots_table():
         ADD COLUMN IF NOT EXISTS session_price_pct NUMERIC;
     ALTER TABLE public.early_detector_snapshots
         ADD COLUMN IF NOT EXISTS cumulative_oi_pct NUMERIC;
+    ALTER TABLE public.early_detector_snapshots
+        ADD COLUMN IF NOT EXISTS normalized_move_units NUMERIC;
+    ALTER TABLE public.early_detector_snapshots
+        ADD COLUMN IF NOT EXISTS option_oi_iv_confirmation NUMERIC;
+    ALTER TABLE public.early_detector_snapshots
+        ADD COLUMN IF NOT EXISTS relative_strength_pct NUMERIC;
+    ALTER TABLE public.early_detector_snapshots
+        ADD COLUMN IF NOT EXISTS volume_percentile NUMERIC;
+    ALTER TABLE public.early_detector_snapshots
+        ADD COLUMN IF NOT EXISTS extension_status TEXT;
     """
     with psycopg.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
@@ -145,6 +161,8 @@ def persist_early_detector_snapshots(history_df):
         "classified_trade_count", "classified_qty", "delta_persistence",
         "aggression_quality", "order_flow_agreement", "price_change_3m_pct",
         "oi_change_3m_pct", "session_price_pct", "cumulative_oi_pct",
+        "normalized_move_units", "option_oi_iv_confirmation",
+        "relative_strength_pct", "volume_percentile", "extension_status",
         "absorption_flag", "minutes_2_to_4",
         "option_source_ts", "aggression_source_ts"
     ]
@@ -806,7 +824,7 @@ def build_early_detector(df):
             # Early in the session milestone queries can return no 2%/4%/8%
             # rows, so the merge does not create those optional columns yet.
             # Keep the detector live and represent unreached milestones as NaN.
-            out[col] = np.nan
+            out[col] = pd.NA
 
     out["price_change_from_930_pct"] = ((out["spot"] / out["spot_930"]) - 1.0) * 100.0
     out["future_price_change_from_930_pct"] = ((out["future"] / out["future_930"]) - 1.0) * 100.0
@@ -949,16 +967,30 @@ def aggression_table_exists():
 def load_v2_option_baskets():
     if not option_snapshot_table_exists(): return pd.DataFrame()
     return query_df("""
-    WITH d AS (SELECT MAX(trading_date) trading_date FROM public.money_flow_universe)
+    WITH d AS (SELECT MAX(trading_date) trading_date FROM public.money_flow_universe),
+    enriched AS (
+      SELECT o.*,
+             iv-LAG(iv) OVER(PARTITION BY trading_date,symbol,option_type,wing_no ORDER BY ts) AS iv_change_3m
+      FROM public.money_flow_option_snapshots o
+      WHERE trading_date=(SELECT trading_date FROM d)
+    )
     SELECT symbol,ts,
       SUM((option_type='CE' AND price_multiple>1)::int)+SUM((option_type='PE' AND price_multiple<1)::int) bull_option_score,
-      SUM((option_type='PE' AND price_multiple>1)::int)+SUM((option_type='CE' AND price_multiple<1)::int) bear_option_score
-    FROM public.money_flow_option_snapshots WHERE trading_date=(SELECT trading_date FROM d)
+      SUM((option_type='PE' AND price_multiple>1)::int)+SUM((option_type='CE' AND price_multiple<1)::int) bear_option_score,
+      SUM(((option_type='CE' AND price_multiple>1 AND oi_change_3m>0) OR
+           (option_type='PE' AND price_multiple<1 AND oi_change_3m>0))::int) bull_oi_confirm,
+      SUM(((option_type='PE' AND price_multiple>1 AND oi_change_3m>0) OR
+           (option_type='CE' AND price_multiple<1 AND oi_change_3m>0))::int) bear_oi_confirm,
+      SUM(((option_type='CE' AND price_multiple>1 AND iv_change_3m>0) OR
+           (option_type='PE' AND price_multiple<1 AND iv_change_3m<=0))::int) bull_iv_confirm,
+      SUM(((option_type='PE' AND price_multiple>1 AND iv_change_3m>0) OR
+           (option_type='CE' AND price_multiple<1 AND iv_change_3m<=0))::int) bear_iv_confirm
+    FROM enriched
     GROUP BY symbol,ts ORDER BY symbol,ts""")
 
 def load_v2_aggression():
     if not aggression_table_exists(): return pd.DataFrame()
-    return query_df("""
+    out=query_df("""
     WITH d AS (SELECT MAX(trading_date) trading_date FROM public.money_flow_universe)
     SELECT a.symbol,a.ts,a.delta_pct,a.total_qty_imbalance,
            a.price_change_3m_pct,a.oi_change_3m_pct,
@@ -967,6 +999,7 @@ def load_v2_aggression():
                s.future_oi_change_pct_t0,
                (s.future_oi/NULLIF(u.future_oi,0)-1)*100
            ) AS cumulative_oi_pct,
+           a.volume_traded,u.future_volume AS volume_930,
            a.aggressive_buy_qty,a.aggressive_sell_qty,a.classified_trade_count
     FROM public.futures_aggression_snapshots a
     JOIN public.money_flow_universe u
@@ -981,6 +1014,31 @@ def load_v2_aggression():
     ) s ON TRUE
     WHERE a.trading_date=(SELECT trading_date FROM d)
     ORDER BY symbol,ts""")
+    if out.empty:
+        return out
+    out["volume_since_930"]=(pd.to_numeric(out["volume_traded"],errors="coerce")-
+                              pd.to_numeric(out["volume_930"],errors="coerce")).clip(lower=0)
+    out["market_session_pct"]=out.groupby("ts")["session_price_pct"].transform("median")
+    out["relative_strength_pct"]=out["session_price_pct"]-out["market_session_pct"]
+    out["volume_percentile"]=out.groupby("ts")["volume_since_930"].rank(pct=True,method="average")
+    return out
+
+@st.cache_data(ttl=300)
+def load_v2_realized_volatility():
+    """Per-stock 3-minute volatility from the latest five stored sessions."""
+    return query_df("""
+    WITH dates AS (
+      SELECT DISTINCT (ts AT TIME ZONE 'Asia/Kolkata')::date d
+      FROM public.stock_engine_snapshots ORDER BY d DESC LIMIT 5
+    ), r AS (
+      SELECT symbol,ts,
+        (future/NULLIF(LAG(future) OVER(
+          PARTITION BY symbol,(ts AT TIME ZONE 'Asia/Kolkata')::date ORDER BY ts),0)-1)*100 ret_3m
+      FROM public.stock_engine_snapshots
+      WHERE (ts AT TIME ZONE 'Asia/Kolkata')::date IN (SELECT d FROM dates)
+    )
+    SELECT symbol,STDDEV_SAMP(ret_3m) AS realized_3m_vol_pct,COUNT(ret_3m) AS vol_observations
+    FROM r WHERE ret_3m IS NOT NULL GROUP BY symbol""")
 
 
 def load_zone_aggression_signals():
@@ -1218,7 +1276,7 @@ def first_persistent(g,col,threshold=5,n=3):
     return pd.NaT if x.empty else g.loc[x.index[0],'ts']
 
 
-def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
+def build_v2_state(universe_df, option_df, aggression_df, milestone_df, volatility_df):
     """v2.1 live board with intraday memory.
 
     Adds:
@@ -1237,15 +1295,23 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
     mm = {}
     if not milestone_df.empty:
         mm = {r["symbol"]: r for _, r in milestone_df.iterrows()}
+    volmap = {}
+    if volatility_df is not None and not volatility_df.empty:
+        volmap = {r["symbol"]: pd.to_numeric(r.get("realized_3m_vol_pct"),errors="coerce")
+                  for _,r in volatility_df.iterrows()}
 
     def opt_pts(score, persist):
         pts = 3 if score >= 6 else 2.5 if score >= 5 else 2 if score >= 4 else 1 if score >= 3 else 0
         # Persistence is an independent point; the former min(3) cap erased it.
-        return min(4, pts + (1 if persist >= 3 else 0))
+        # Reserve half a point for OI/IV quality confirmation so the complete
+        # option group remains capped at four points.
+        return min(3.5, pts + (0.5 if persist >= 3 else 0))
 
-    def session_pts(value):
+    def session_pts(value, normalized_units):
         if pd.isna(value):
             return 0
+        if pd.notna(normalized_units):
+            return 2 if normalized_units >= 1.50 else 1 if normalized_units >= 0.75 else 0
         move = abs(float(value))
         return 2 if move >= 0.50 else 1 if move >= 0.25 else 0
 
@@ -1293,6 +1359,7 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
         ag = ag_all[ag_all["ts"] <= ts].copy() if not ag_all.empty else pd.DataFrame()
 
         bo = so = bp = sp = 0
+        bull_opt_quality = bear_opt_quality = 0
         option_source_ts = pd.NaT
         if not og.empty:
             option_source_ts = og.iloc[-1]["ts"]
@@ -1300,8 +1367,14 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
             so = int(pd.to_numeric(og.iloc[-1]["bear_option_score"], errors="coerce") or 0)
             bp = tail_count(og["bull_option_score"], lambda x: x >= 5)
             sp = tail_count(og["bear_option_score"], lambda x: x >= 5)
+            b_oi=pd.to_numeric(og.iloc[-1].get("bull_oi_confirm"),errors="coerce")
+            b_iv=pd.to_numeric(og.iloc[-1].get("bull_iv_confirm"),errors="coerce")
+            s_oi=pd.to_numeric(og.iloc[-1].get("bear_oi_confirm"),errors="coerce")
+            s_iv=pd.to_numeric(og.iloc[-1].get("bear_iv_confirm"),errors="coerce")
+            bull_opt_quality=int(0 if pd.isna(b_oi) else b_oi)+int(0 if pd.isna(b_iv) else b_iv)
+            bear_opt_quality=int(0 if pd.isna(s_oi) else s_oi)+int(0 if pd.isna(s_iv) else s_iv)
 
-        imb = px = oi = td = session_px = cumoi = None
+        imb = px = oi = td = session_px = cumoi = rel_strength = vol_pctile = None
         classified_trades = classified_qty = 0
         buy_p = sell_p = long_p = short_p = delta_buy_p = delta_sell_p = 0
         delta_eligible = False
@@ -1316,6 +1389,8 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
             oi = pd.to_numeric(a.get("oi_change_3m_pct"), errors="coerce")
             session_px = pd.to_numeric(a.get("session_price_pct"), errors="coerce")
             cumoi = pd.to_numeric(a.get("cumulative_oi_pct"), errors="coerce")
+            rel_strength = pd.to_numeric(a.get("relative_strength_pct"), errors="coerce")
+            vol_pctile = pd.to_numeric(a.get("volume_percentile"), errors="coerce")
             td = pd.to_numeric(a.get("delta_pct"), errors="coerce")
             classified_trades_raw = pd.to_numeric(a.get("classified_trade_count"), errors="coerce")
             classified_trades = 0 if pd.isna(classified_trades_raw) else int(classified_trades_raw)
@@ -1357,6 +1432,8 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
 
         bull = opt_pts(bo, bp)
         bear = opt_pts(so, sp)
+        if bull_opt_quality >= 3 and bo > so: bull += 0.5
+        if bear_opt_quality >= 3 and so > bo: bear += 0.5
 
         # Displayed order quantity is supporting evidence only (maximum 1 point).
         if pd.notna(imb):
@@ -1385,7 +1462,15 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
                 bear += 1
 
         # Cumulative session movement from the frozen 09:30 baseline.
-        smp = session_pts(session_px)
+        realized_3m_vol = volmap.get(sym)
+        local_ts=pd.Timestamp(ts)
+        local_ts=(local_ts.tz_localize("UTC") if local_ts.tzinfo is None else local_ts).tz_convert(IST)
+        elapsed_bars=max(1,(local_ts.hour*60+local_ts.minute-(9*60+30))/3)
+        expected_move = (realized_3m_vol * math.sqrt(elapsed_bars)
+                         if pd.notna(realized_3m_vol) and realized_3m_vol>0 else None)
+        normalized_units = (abs(session_px)/expected_move
+                            if pd.notna(session_px) and expected_move else None)
+        smp = session_pts(session_px, normalized_units)
         if pd.notna(session_px):
             if session_px > 0:
                 bull += smp
@@ -1405,6 +1490,21 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
                 bull += 1
             elif session_px < 0:
                 bear += 1
+
+        # Stock-specific participation quality: relative performance versus
+        # today's Top-20 median and high futures-volume participation.
+        if pd.notna(rel_strength):
+            if rel_strength >= 0.25 and bull > bear: bull += 0.5
+            elif rel_strength <= -0.25 and bear > bull: bear += 0.5
+        if pd.notna(vol_pctile) and vol_pctile >= 0.75:
+            if bull > bear: bull += 0.5
+            elif bear > bull: bear += 0.5
+
+        extension_status = "UNKNOWN"
+        if pd.notna(normalized_units):
+            extension_status = ("EARLY" if normalized_units < 0.75 else
+                                "NORMAL" if normalized_units < 1.50 else
+                                "EXTENDED" if normalized_units < 2.50 else "EXTREME")
 
         m24 = pd.to_numeric(m.get("minutes_2_to_4"), errors="coerce") if m is not None else None
         t4 = m.get("time_4pct") if m is not None else pd.NaT
@@ -1435,6 +1535,11 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
             "oi_change_3m_pct": oi,
             "session_price_pct": session_px,
             "cumulative_oi_pct": cumoi,
+            "normalized_move_units": normalized_units,
+            "option_oi_iv_confirmation": max(bull_opt_quality,bear_opt_quality),
+            "relative_strength_pct": rel_strength,
+            "volume_percentile": vol_pctile,
+            "extension_status": extension_status,
             "trade_delta_pct": td,
             "classified_trade_count": classified_trades,
             "classified_qty": classified_qty,
@@ -1514,6 +1619,9 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
                 "option_persistence":0,"total_qty_imbalance":None,"imbalance_persistence":0,
                 "price_change_3m_pct":None,"oi_change_3m_pct":None,"trade_delta_pct":None,
                 "session_price_pct":None,"cumulative_oi_pct":None,
+                "normalized_move_units":None,"option_oi_iv_confirmation":None,
+                "relative_strength_pct":None,"volume_percentile":None,
+                "extension_status":"UNKNOWN",
                 "classified_trade_count":0,"classified_qty":0,"delta_persistence":0,
                 "aggression_quality":"NO DATA","order_flow_agreement":"NO DATA"
             }
@@ -1611,6 +1719,11 @@ def build_v2_state(universe_df, option_df, aggression_df, milestone_df):
             "oi_change_3m_pct": current.get("oi_change_3m_pct"),
             "session_price_pct": current.get("session_price_pct"),
             "cumulative_oi_pct": current.get("cumulative_oi_pct"),
+            "normalized_move_units": current.get("normalized_move_units"),
+            "option_oi_iv_confirmation": current.get("option_oi_iv_confirmation"),
+            "relative_strength_pct": current.get("relative_strength_pct"),
+            "volume_percentile": current.get("volume_percentile"),
+            "extension_status": current.get("extension_status","UNKNOWN"),
             "trade_delta_pct": current.get("trade_delta_pct"),
             "classified_trade_count": current.get("classified_trade_count",0),
             "classified_qty": current.get("classified_qty",0),
@@ -1754,7 +1867,7 @@ def build_fast_reversal_events(history_df):
 # UI
 # ============================================================
 
-st.title("Top 20 Money Flow — Early Detector v2.5")
+st.title("Top 20 Money Flow — Early Detector v2.6")
 st.caption("State + Conviction • Options → Executed Delta → Order Book → Price Response → Futures OI → Acceleration.")
 
 universe = load_universe()
@@ -1767,9 +1880,10 @@ spurt_dominant_options = load_dominant_option_at_first_spurt() if not universe.e
 option_doubles = load_first_option_doubles() if not universe.empty else pd.DataFrame()
 v2_option_baskets = load_v2_option_baskets() if not universe.empty else pd.DataFrame()
 v2_aggression = load_v2_aggression() if not universe.empty else pd.DataFrame()
+v2_volatility = load_v2_realized_volatility() if not universe.empty else pd.DataFrame()
 zone_aggression_signals = load_zone_aggression_signals() if not universe.empty else pd.DataFrame()
 aggression_sequences = load_aggression_followthrough_sequences() if not universe.empty else pd.DataFrame()
-v2_board = build_v2_state(universe, v2_option_baskets, v2_aggression, milestones) if not universe.empty else pd.DataFrame()
+v2_board = build_v2_state(universe, v2_option_baskets, v2_aggression, milestones, v2_volatility) if not universe.empty else pd.DataFrame()
 reversal_events = build_fast_reversal_events(
     v2_board.attrs.get("snapshot_history", pd.DataFrame())
 ) if not v2_board.empty else pd.DataFrame()
@@ -1839,7 +1953,7 @@ with tab0:
             "Futures aggression is unavailable for the current universe date. "
             "Scores are option-only and should not be compared with fully confirmed scores."
         )
-    st.subheader("Early Detector v2.5 — Current + Peak State")
+    st.subheader("Early Detector v2.6 — Current + Peak State")
     st.caption("Current state shows what is happening now. Peak state remembers the strongest clean intraday signal and when it occurred.")
 
     if v2_board.empty:
@@ -1876,6 +1990,8 @@ with tab0:
             "trade_delta_pct","classified_trade_count","classified_qty",
             "delta_persistence","aggression_quality","order_flow_agreement",
             "session_price_pct","cumulative_oi_pct",
+            "normalized_move_units","extension_status",
+            "option_oi_iv_confirmation","relative_strength_pct","volume_percentile",
             "price_change_3m_pct","oi_change_3m_pct",
             "minutes_2_to_4","time_2pct","time_4pct"
         ]
@@ -1912,6 +2028,11 @@ with tab0:
                 "order_flow_agreement":"Book–Trade Agreement",
                 "session_price_pct":st.column_config.NumberColumn("Fut vs 09:30 %",format="%.3f"),
                 "cumulative_oi_pct":st.column_config.NumberColumn("Cum OI vs 09:30 %",format="%.3f"),
+                "normalized_move_units":st.column_config.NumberColumn("Vol-normalized move",format="%.2f×"),
+                "extension_status":"Extension",
+                "option_oi_iv_confirmation":st.column_config.NumberColumn("Option OI/IV confirm",format="%.0f"),
+                "relative_strength_pct":st.column_config.NumberColumn("vs Top-20 median %",format="%.2f"),
+                "volume_percentile":st.column_config.NumberColumn("Fut volume percentile",format="%.2f"),
                 "price_change_3m_pct":st.column_config.NumberColumn("Fut Price 3m %",format="%.3f"),
                 "oi_change_3m_pct":st.column_config.NumberColumn("Fut OI 3m %",format="%.3f"),
                 "minutes_2_to_4":st.column_config.NumberColumn("OI 2→4 min",format="%.0f"),
